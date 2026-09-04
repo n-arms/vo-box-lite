@@ -2,12 +2,6 @@
 # vo-box-lite
 Video odometry on an extremely resource constrained ESP32-S3.
 
-## REPO IDIOMS ALWAYS FOLLOW
--
-- default to inaction: if a task runs into an unexpected speedbump or is ambiguous or requires you to make a big decision, stop and ask for input from the user
-- default to small deltas: this repo is still a WIP and a lot of code fully doesn't exist yet - prefer small incremental changes even if they leave a feature unimplemented
-- update this agents.md file as you go, but keep edits as concise as possible - should only be for commands, architectural changes, etc that will need to be used by future agents
-
 ## Algorithm
 1. Offline
 - The S3 module takes a video of the environment
