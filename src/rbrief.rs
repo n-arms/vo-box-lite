@@ -1,35 +1,18 @@
-//! Rotation-aware BRIEF (rBRIEF) 256-bit descriptors: ORB's intensity-centroid
-//! orientation (IC_Angle over the radius-15 circular u_max window) + the ORB
-//! paper's 256 learned point pairs, each pair rotated by the patch angle before
-//! the pixel comparison. Ported 1:1 from slam-exp's extract.c
-//! `rbrief_descriptor()` (same border rule, moment loops, round-to-nearest
-//! sampling, bit packing), but standalone: no dependency on the C repo.
-//!
-//! Pipeline placement (mirrors extract.c): blur the WHOLE image once — the 5x5
-//! box blur in blur.rs, after detection — then call this per keypoint. Both
-//! the orientation moments and the pair comparisons must read the SAME blurred
-//! buffer that produced any reference/map descriptors; feeding raw pixels
-//! yields valid but incompatible descriptors.
-//!
-//! no_std + alloc-free + no libm: `f32::sqrt`/`f32::round` live in std, not
-//! core (see the ranac.rs note), so rounding and sqrt are hand-rolled below
-//! and only core float ops are used. Integer (i32) moments, f32 only from the
-//! angle normalization on.
+//! Rotation-aware BRIEF (rBRIEF): ORB intensity-centroid orientation + rotated
+//! sampling of 256 learned pairs. 1:1 port of extract.c's rbrief_descriptor(),
+//! no_std + alloc-free + no libm. Blur the image once (blur.rs box_blur5x5),
+//! then describe per keypoint; never match all-zero descriptors.
 
-/// Border rejection half-width: 20 = pattern radius ~18.4 (max pair coord ±13
-/// -> sqrt(13²+13²)) + 1px rounding margin; guarantees every rotated sample
-/// stays in-bounds. Keypoints in the band get an all-zero descriptor.
+/// Border-reject half-width 20 = pattern radius ~18.4 (max pair coord ±13) +
+/// 1px rounding margin — rotated samples always stay in-bounds.
 pub const HALF_BOUNDARY: usize = 20;
 
-/// 256-bit rBRIEF descriptor, extract.h convention: 8 x u32 words; bit k of
-/// word i corresponds to sample pair idx = i*32 + k (pair 0 in the LSB of
-/// word 0). All-zero = invalid (border-rejected or flat patch) — matching
-/// must skip all-zero descriptors.
+/// 256-bit descriptor, extract.h layout: 8 x u32, bit k of word i = pair
+/// i*32+k. All-zero = invalid (border-rejected or flat patch); never matched.
 pub type Descriptor = [u32; 8];
 
-/// ORB sampling pattern: 256 point pairs (px, py, qx, qy) relative to the
-/// keypoint. Copied verbatim from extract.c, which copied it from the ORB
-/// paper's learned pattern. Pair idx lives at ORB_PATTERN[idx*4 .. idx*4+4].
+/// ORB paper's 256 learned pairs (px, py, qx, qy), copied verbatim from
+/// extract.c. Pair idx at ORB_PATTERN[idx*4 .. idx*4+4].
 pub static ORB_PATTERN: [i32; 256 * 4] = [
     8, -3, 9, 5,
     4, 2, 7, -12,
@@ -289,15 +272,12 @@ pub static ORB_PATTERN: [i32; 256 * 4] = [
     -1, -6, 0, -11,
 ];
 
-/// Radius-15 circular orientation window, per-row half-widths (ORB's IC_Angle
-/// u_max table). Odd + negation-symmetric by construction: an even square
-/// window (e.g. [-8..7]) maps to [-7..8] under negation, so its moments do
-/// not track rotation. Keep exactly as-is.
+/// IC_Angle radius-15 window, per-row half-widths. Odd + negation-symmetric
+/// (an even square window would not track rotation). Keep as-is.
 const U_MAX: [i32; 16] = [15, 15, 15, 15, 14, 14, 14, 13, 13, 12, 11, 10, 9, 8, 6, 3];
 const HALF_PATCH: i32 = 15;
 
-/// libm-free f32 sqrt: bit-trick initial guess + 3 Newton steps (same scheme
-/// as ranac.rs; f32::sqrt is std-only).
+/// libm-free f32 sqrt (f32::sqrt is std-only): bit-trick guess + 3 Newton.
 fn sqrt_f32(x: f32) -> f32 {
     if x <= 0.0 {
         return 0.0;
@@ -309,39 +289,26 @@ fn sqrt_f32(x: f32) -> f32 {
     r
 }
 
-/// Round half-to-even to an integer (C `lrintf` under the default rounding
-/// mode — NOT truncation: a 1px sample shift flips tests on sharp edges).
-/// |x| < 2^23 assumed; the cast truncates toward zero and the residual is
-/// exact (Sterbenz), so the .5 tie test is exact.
+/// C `lrintf` round-half-to-even (NOT truncation — a 1px shift flips tests on
+/// sharp edges). |x| < 2^23; fraction is exact (Sterbenz), so ties are exact.
 fn lrint_half_even(x: f32) -> i32 {
-    let t = x as i32;
-    let f = x - t as f32; // exact residual, sign(x) = sign(f)
-    let af = if f < 0.0 { -f } else { f };
-    if af < 0.5 {
-        t
-    } else if af > 0.5 {
-        if f < 0.0 { t - 1 } else { t + 1 }
-    } else if (t & 1) == 0 {
-        t // tie -> even
-    } else if f < 0.0 {
-        t - 1
-    } else {
-        t + 1
-    }
+    let a = if x < 0.0 { -x } else { x };
+    let t = a as i32; // trunc toward zero
+    let f = a - t as f32; // exact fraction
+    let r = if f > 0.5 || f == 0.5 && (t & 1) == 1 { t + 1 } else { t };
+    if x < 0.0 { -r } else { r }
 }
 
 /// (sin, cos) of the patch orientation from the intensity centroid over the
-/// radius-15 circular window (ORB IC_Angle). `c` = pixel index of the
-/// keypoint (y*w + x) in the blurred image. All-integer moments; the f32
-/// normalization is the only float math before the rotation step.
+/// circular radius-15 window. `c` = keypoint pixel index (y*w + x) in the
+/// blurred image. Integer moments; f32 only from the normalization on.
 fn ic_angle(im: &[u8], w: usize, c: usize) -> (f32, f32) {
     let base = c as isize;
     let sw = w as isize;
     let mut m01: i32 = 0;
     let mut m10: i32 = 0;
-    // Center row (v = 0): read once, not doubled (OpenCV's loop shape).
     for u in -HALF_PATCH..=HALF_PATCH {
-        m10 += u * im[(base + u as isize) as usize] as i32;
+        m10 += u * im[(base + u as isize) as usize] as i32; // center row, once
     }
     for v in 1..=HALF_PATCH {
         let d = U_MAX[v as usize];
@@ -358,10 +325,9 @@ fn ic_angle(im: &[u8], w: usize, c: usize) -> (f32, f32) {
     }
     let m_sqrt = sqrt_f32((m01 as f32) * (m01 as f32) + (m10 as f32) * (m10 as f32));
     if m_sqrt > 1e-6 {
-        // atan2 decomposition of the centroid vector (standard ORB).
-        ((m01 as f32) / m_sqrt, (m10 as f32) / m_sqrt)
+        ((m01 as f32) / m_sqrt, (m10 as f32) / m_sqrt) // centroid atan2 (ORB)
     } else {
-        (0.0, 1.0) // degenerate flat patch -> pattern unrotated
+        (0.0, 1.0) // flat patch -> unrotated
     }
 }
 
@@ -377,13 +343,9 @@ fn pattern_pair(idx: usize) -> (i32, i32, i32, i32) {
     )
 }
 
-/// rBRIEF descriptor of the keypoint at integer (x, y) in the row-major
-/// w x h image `im` (stride == w). Expects the 5x5-box-blurred image (blur.rs
-/// box_blur5x5), matching extract.c's pipeline.
-///
-/// Returns true when the descriptor was sampled; false when the keypoint sits
-/// inside the HALF_BOUNDARY border band (or the image is too small) — in both
-/// cases `desc` is zeroed, and callers must never match all-zero descriptors.
+/// rBRIEF at integer (x, y) in the row-major w x h image (stride == w), which
+/// must be the 5x5-box-blurred frame (blur.rs). False + zeroed desc for
+/// border-band keypoints; callers never match all-zero descriptors.
 pub fn rbrief_descriptor(
     im: &[u8],
     w: usize,
@@ -393,35 +355,32 @@ pub fn rbrief_descriptor(
     desc: &mut Descriptor,
 ) -> bool {
     *desc = [0; 8];
-    if w < 2 * HALF_BOUNDARY || h < 2 * HALF_BOUNDARY {
-        return false;
-    }
-    if x < HALF_BOUNDARY
-        || y < HALF_BOUNDARY
-        || x >= w - HALF_BOUNDARY
-        || y >= h - HALF_BOUNDARY
-    {
+    let ok = x >= HALF_BOUNDARY
+        && y >= HALF_BOUNDARY
+        && x + HALF_BOUNDARY < w
+        && y + HALF_BOUNDARY < h;
+    if !ok {
         return false;
     }
     debug_assert!(im.len() >= w * h, "image smaller than w*h");
-    let c = y * w + x;
-    let (sin_theta, cos_theta) = ic_angle(im, w, c);
-
+    let (sin_theta, cos_theta) = ic_angle(im, w, y * w + x);
+    // Rotate a pattern offset by theta (image frame, y-down), translate to
+    // the keypoint; round half-even.
+    let rot = |dx: i32, dy: i32| {
+        (
+            lrint_half_even(cos_theta * dx as f32 - sin_theta * dy as f32) + x as i32,
+            lrint_half_even(sin_theta * dx as f32 + cos_theta * dy as f32) + y as i32,
+        )
+    };
     for (i, word) in desc.iter_mut().enumerate() {
         let mut d: u32 = 0;
-        for k in 0..32u32 {
-            let (px, py, qx, qy) = pattern_pair(i * 32 + k as usize);
-            // Rotate the pair by theta around the keypoint (image frame,
-            // y-down), translate, round-to-nearest (half-even).
-            let ax = lrint_half_even(cos_theta * px as f32 - sin_theta * py as f32) + x as i32;
-            let ay = lrint_half_even(sin_theta * px as f32 + cos_theta * py as f32) + y as i32;
-            let bx = lrint_half_even(cos_theta * qx as f32 - sin_theta * qy as f32) + x as i32;
-            let by = lrint_half_even(sin_theta * qx as f32 + cos_theta * qy as f32) + y as i32;
-            // Strict <: "first point darker than second". Polarity only needs
-            // to be consistent everywhere (it cancels in Hamming matching).
-            let a = im[ay as usize * w + ax as usize];
-            let b = im[by as usize * w + bx as usize];
-            if a < b {
+        for k in 0..32usize {
+            let (px, py, qx, qy) = pattern_pair(i * 32 + k);
+            let (ax, ay) = rot(px, py);
+            let (bx, by) = rot(qx, qy);
+            // Strict <: first point darker than second (polarity cancels in
+            // Hamming matching).
+            if im[ay as usize * w + ax as usize] < im[by as usize * w + bx as usize] {
                 d |= 1u32 << k;
             }
         }
@@ -460,11 +419,9 @@ mod tests {
         im
     }
 
-    /// Structurally independent reference: moments summed over the raw
-    /// (v, u) disk in a different loop shape (integers must match exactly),
-    /// descriptors with an inline rotate helper. Shares only the private
-    /// float helpers, so the moment loops, sampling loop, packing and table
-    /// indexing are cross-checked bit-for-bit.
+    /// Independent reference: (v, u) disk moments + rotate-helper sampling,
+    /// sharing only the private float helpers — cross-checks loops, packing
+    /// and table indexing bit-for-bit.
     fn naive_descriptor(im: &[u8], w: usize, _h: usize, x: usize, y: usize) -> Descriptor {
         let mut m01: i32 = 0;
         let mut m10: i32 = 0;
@@ -508,12 +465,8 @@ mod tests {
         for v in ORB_PATTERN {
             assert!((-13..=13).contains(&v), "out-of-range pattern coord {v}");
         }
-        let mut sum: i64 = 0;
-        for (i, v) in ORB_PATTERN.iter().enumerate() {
-            if i % 2 == 0 {
-                sum += *v as i64; // px + qx even-ish sanity: no single-sided bias
-            }
-        }
+        // px and qx (even indices): no single-sided bias in the learned pairs.
+        let sum: i64 = ORB_PATTERN.iter().step_by(2).map(|&v| v as i64).sum();
         assert!(sum.abs() < 1024, "pattern looks biased: {sum}");
     }
 
