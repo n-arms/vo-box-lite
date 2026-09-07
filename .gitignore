@@ -17,3 +17,13 @@
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# esp-idf-sys component-manager lock (like Cargo.lock, regenerated on build;
+# the esp32-camera version is pinned via Cargo.toml extra_components metadata)
+/components_esp32s3.lock
+
+# Output of scripts/receive_frames.py (saved BMP frames)
+/frames/
+
+# Python bytecode cache
+**/__pycache__/

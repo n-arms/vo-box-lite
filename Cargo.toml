@@ -25,8 +25,25 @@ opt-level = "z"
 [dependencies]
 log = "0.4"
 esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+# Direct dep for GPIO/delay in the blink smoke test (main.rs); same version esp-idf-svc pulls in.
+esp-idf-hal = "0.46.2"
+# Direct dep needed for the raw esp-camera bindings (esp_idf_sys::camera) + EspError.
+# Same version esp-idf-hal already pulls in; features unify.
+esp-idf-sys = "0.37.2"
 # Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 
 [build-dependencies]
 embuild = "0.33"
+
+# Compile the esp32-camera C component (espressif/esp32-camera from the ESP-IDF
+# component registry, pulled by the IDF component manager at build time) and have
+# esp-idf-sys bindgen-generate raw bindings from esp32_camera_bindings.h into a
+# dedicated `camera` module (esp_idf_sys::camera).
+# Docs: https://github.com/esp-rs/esp-idf-sys/blob/master/BUILD-OPTIONS.md#extra-esp-idf-components
+[package.metadata."esp-idf-sys"]
+extra_components = [
+    { remote_component = { name = "espressif/esp32-camera", version = "2.1.7" },
+      bindings_header = "esp32_camera_bindings.h",
+      bindings_module = "camera" },
+]
