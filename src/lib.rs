@@ -8,3 +8,4 @@ pub mod blur;
 pub mod downscale;
 pub mod fast;
 pub mod ranac;
+pub mod rbrief;
