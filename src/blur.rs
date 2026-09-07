@@ -1,37 +1,14 @@
-//! 5x5 box blur over contiguous grayscale frames (camera VGA 640x480 u8,
-//! row-major, one byte per pixel). `no_std`, alloc-free, no deps.
-//!
-//! The 5x5 box is separable, so the blur runs as two 1-D sliding windows:
-//!
-//!  1. **Vertical** pass: `vcol[x]` holds the sum of the 5 source pixels in
-//!     column `x` over output rows `y-2..=y+2`. Sliding the window down one
-//!     row costs one add + one subtract per column instead of 5 loads.
-//!  2. **Horizontal** pass: the output row is a 5-tap sliding sum over the
-//!     column sums, written straight to `dst` (one u8 store per pixel).
-//!
-//! Cost is ~2 u8 loads + a few u16 ops per pixel (plus one multiply-shift
-//! "divide by 25"); no SIMD, no stack scratch. `scratch` is one u16 row of
-//! `width` entries — 1280 B at VGA — and should live in **internal SRAM**
-//! (a static/section, not PSRAM) since it is read/written every output row.
-//! Source/destination rows are contiguous with `stride == width`, which is
-//! how the esp32-camera driver hands out grayscale frames.
-//!
-//! Borders use clamp (edge-replicate) semantics: out-of-window taps sample
-//! the nearest in-bounds pixel. Border *rows* (top/bottom 2) are computed
-//! with a direct 25-tap clamped kernel; border *columns* fall out of the
-//! clamped ends of the sliding windows, so the interior fast path never
-//! branches.
+//! 5x5 box blur over contiguous grayscale frames (u8, row-major): separable
+//! sliding windows (~2 loads/px, no SIMD), clamp borders, no_std + alloc-free.
+//! `scratch` = one u16 row of `width` (1280 B at VGA — keep in internal SRAM).
 
 /// Full kernel width/height (always 5).
 const WINDOW: usize = 5;
 /// Kernel half-width (always 2).
 const RADIUS: usize = 2;
 
-/// Round-half-up divide by 25, exact for every sum a 5x5 u8 window can
-/// produce (max 25*255 = 6375): `s * ceil(2^20/25)` approximates `s/25` to
-/// within 0.0003, and the `2^19` rounding term makes the truncation equal
-/// round-half-up for ALL `s <= 6375` (asserted exhaustively in tests).
-/// Mul + shift beats the Xtensa divide for 307k pixels.
+/// Round-half-up divide by 25, exact for all sums <= 6375 (max 5x5 u8 window):
+/// `(s*41943 + 2^19) >> 20`. Mul-shift beats the Xtensa divide at 307k px.
 #[inline(always)]
 fn div25(s: u16) -> u8 {
     ((s as u32 * 41943 + (1 << 19)) >> 20) as u8
@@ -107,15 +84,9 @@ fn out_row_from_vcol(vcol: &[u16], w: usize, dst_row: &mut [u8]) {
     dst_row[w - 1] = div25(v[w - 3] + v[w - 2] + 3 * v[w - 1]);
 }
 
-/// 5x5 box blur (clamp borders) of a grayscale `width`x`height` frame.
-///
-/// `src` and `dst` must each hold at least `width*height` bytes and may
-/// overlap **only if identical** — pass the driver's PSRAM frame buffer as
-/// `src` and a second empty PSRAM buffer as `dst`. `scratch` needs
-/// `>= width` u16 entries (1280 B at VGA; keep it in internal RAM).
-///
-/// Returns `false` on invalid sizes (lengths too small, zero dimension);
-/// on success `dst[..width*height]` holds the blurred frame.
+/// 5x5 box blur (clamp borders), grayscale `src` -> `dst` (w*h bytes each;
+/// src = camera PSRAM fb, dst = second PSRAM buffer). `scratch` >= width u16.
+/// False on invalid sizes; success fills `dst[..w*h]`.
 pub fn box_blur5x5(
     src: &[u8],
     dst: &mut [u8],
