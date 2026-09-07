@@ -5,4 +5,5 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod blur;
+pub mod fast;
 pub mod ranac;
