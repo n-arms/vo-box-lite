@@ -76,7 +76,11 @@ fn out_row_from_vcol(vcol: &[u16], w: usize, dst_row: &mut [u8]) {
     let mut s: u32 = (v[0] + v[1] + v[2] + v[3] + v[4]) as u32;
     dst_row[2] = div25(s as u16);
     for x in 3..w - 2 {
-        s += v[x + 2] as u32 - v[x - 3] as u32;
+        // Slide: drop v[x-3], add v[x+2]. s always contains v[x-3] (it is a
+        // 5-window sum), so subtract FIRST — a combined `s += v[x+2] - v[x-3]`
+        // underflows u32 in debug builds whenever the window shrinks.
+        s -= v[x - 3] as u32;
+        s += v[x + 2] as u32;
         dst_row[x] = div25(s as u16);
     }
     // x = w-2, w-1: windows (...,w-1,w-1) and (...,w-1,w-1,w-1).
