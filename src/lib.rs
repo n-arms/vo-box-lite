@@ -7,3 +7,4 @@
 pub mod blur;
 pub mod fast;
 pub mod ranac;
+pub mod rbrief;
