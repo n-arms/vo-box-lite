@@ -1,16 +1,13 @@
-//! SoftAP + TCP feature server — the S3-side "localization engine" stream:
-//! capture the largest grayscale frame the OV3660 can output (QXGA 2048x1536),
-//! 4x4 INTER_AREA downsample it (`vo_box_lite::downscale::downscale_4x4`) to a
-//! manageable 512x384, run the 7-level pyramid extractor on that (FAST-12 +
-//! 5x5 box blur + rBRIEF at 1x..1.2^6x, `vo_box_lite::pyramid`), then stream
-//! the downsampled frame + all features as one VOX2 record per frame. Wire
-//! format (length-prefixed records): see scripts/receive_frames.py.
+//! SoftAP + TCP map-task server: the MCU idles until the laptop sends an STRT
+//! command, then streams VOX2 frame+feature records at the requested pace for
+//! the requested duration and ends with a VOXD "done" record (see receive_map).
 
 #[path = "../camera.rs"]
 mod camera;
 
 use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::peripherals::Peripherals;
@@ -28,6 +25,16 @@ const AP_PASS: &str = "vobox1234"; // TODO: real passphrase
 const TCP_PORT: u16 = 5000;
 /// IDF v5.5 default AP IP; fallback if the netif-up poll times out.
 const AP_IP_FALLBACK: Ipv4Addr = Ipv4Addr::new(192, 168, 71, 1);
+/// Command magic laptop -> MCU, sent right after connect: `u32 LE n | "STRT"`
+/// [+ payload]. The MCU streams nothing until STRT arrives.
+const MAGIC_START: &[u8; 4] = b"STRT";
+/// STRT payload defaults (the command can override; see read_start_command):
+/// 30 s run, one frame per 1000 ms (0 = max rate), 60 s STRT timeout.
+const DEFAULT_DURATION_S: u64 = 30;
+const DEFAULT_INTERVAL_MS: u64 = 1000;
+const START_TIMEOUT_S: u64 = 60;
+/// Record magic for the final "done mapping" record.
+const MAGIC_DONE: &[u8; 4] = b"VOXD";
 /// Record magic for frame+features (VOX2).
 const MAGIC: &[u8; 4] = b"VOX2";
 /// esp32-camera PIXFORMAT_GRAYSCALE (the only format we configure).
@@ -101,9 +108,9 @@ fn main() -> Result<(), EspError> {
     feature_server(listener, camera.as_ref())
 }
 
-/// One persistent connection at a time; per frame: capture (QXGA) -> 4x4
-/// downsample -> pyramid -> send VOX2 (frame + features). Re-accepts when the
-/// laptop drops.
+/// Serve one connection = one map run: wait for the laptop's STRT command,
+/// stream paced VOX2 frames until the run deadline, then send the VOXD done
+/// record and drop the connection (re-accept for the next run).
 fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
     // Pipeline buffers are sized for the downsampled level-0 dims and reused
     // every frame (no per-frame allocation; see pyramid::extract_pyramid).
@@ -117,10 +124,40 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                 continue;
             }
         };
-        log::info!("laptop connected: {peer}");
+        log::info!("laptop connected: {peer} — waiting for its STRT command");
+        if pipe.is_none() {
+            pipe = Some(MapPipeline::new(CAM_W, CAM_H));
+        }
+        let p = pipe.as_mut().unwrap();
 
+        // Idle until the laptop kicks the map task off (streams nothing
+        // before that). Clean disconnect -> Ok(None); timeout/garbage -> Err.
+        let (dur_s, interval_ms) = match read_start_command(&mut stream) {
+            Ok(Some(params)) => params,
+            Ok(None) => {
+                log::info!("client {peer} disconnected before sending STRT");
+                continue;
+            }
+            Err(e) => {
+                log::warn!("waiting for STRT from {peer} failed ({e}); dropping");
+                continue;
+            }
+        };
+        // Command phase used non-blocking reads; stream writes must block
+        // again (a WouldBlock on a 200 KB VOX2 frame would look like a drop).
+        if let Err(e) = stream.set_nonblocking(false) {
+            log::warn!("set_nonblocking(false) failed ({e}); dropping client");
+            continue;
+        }
+
+        log::info!("starting a {dur_s}s map run for {peer} (frame every {interval_ms} ms)");
+        let run_start = Instant::now();
+        let deadline = run_start + Duration::from_secs(dur_s);
         let mut sent = 0u64;
-        loop {
+        let mut feats_sent = 0u64;
+        let mut interrupted = false; // laptop dropped mid-run
+        while Instant::now() < deadline {
+            let frame_start = Instant::now();
             let cam = match camera {
                 Some(cam) => cam,
                 None => {
@@ -128,10 +165,6 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                     continue;
                 }
             };
-            if pipe.is_none() {
-                pipe = Some(MapPipeline::new(CAM_W, CAM_H));
-            }
-            let p = pipe.as_mut().unwrap();
 
             if let Err(e) = map_frame(cam, p) {
                 log::warn!("map_frame failed ({e})");
@@ -139,16 +172,121 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                 continue;
             }
             // Send the assembled VOX2 record (downsampled frame + features).
-            if let Err(e) = send_record(&mut stream, &p.tx) {
-                log::info!("client {peer} disconnected ({e}); re-accepting");
+            if send_record(&mut stream, &p.tx).is_err() {
+                interrupted = true;
                 break;
             }
             sent += 1;
-            if sent % 20 == 0 {
+            feats_sent += p.last_n as u64;
+            if interval_ms > 0 {
+                log::info!(
+                    "run frame {sent} @ {}s — {} features",
+                    run_start.elapsed().as_secs(),
+                    p.last_n
+                );
+            } else if sent % 20 == 0 {
                 log::info!("streamed {sent} frames to {peer} ({} features/frame)", p.last_n);
             }
+
+            // Pace to one frame per `interval_ms` (capture + pyramid + upload
+            // time counts towards the interval; 0 = as fast as possible).
+            let wait_ms = interval_ms.saturating_sub(frame_start.elapsed().as_millis() as u64);
+            if wait_ms > 0 {
+                FreeRtos::delay_ms(wait_ms as u32);
+            }
+        }
+
+        if !interrupted {
+            // Deadline reached: tell the laptop the run is done, then drop the
+            // connection (it runs COLMAP on the frames it received).
+            build_done_record(&mut p.tx, sent, feats_sent);
+            if let Err(e) = send_record(&mut stream, &p.tx) {
+                log::warn!("done record send failed ({e})");
+            } else {
+                log::info!("map run complete: {sent} frames / {feats_sent} features -> {peer}; VOXD done record sent");
+            }
+        } else {
+            log::info!(
+                "client {peer} disconnected mid-run after {sent} frames; re-accepting"
+            );
         }
     }
+}
+
+/// Read the laptop's start command (length-prefixed records, laptop -> MCU).
+/// Returns Ok(Some((duration_s, interval_ms))) on STRT, Ok(None) if the
+/// client disconnects before sending anything, Err on timeout / bad record.
+fn read_start_command(stream: &mut TcpStream) -> std::io::Result<Option<(u64, u64)>> {
+    let deadline = Instant::now() + Duration::from_secs(START_TIMEOUT_S);
+    stream.set_nonblocking(true)?;
+    loop {
+        let mut len_buf = [0u8; 4];
+        match read_exact_poll(stream, &mut len_buf, deadline) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let n = u32::from_le_bytes(len_buf) as usize;
+        if !(4..=12).contains(&n) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad command record length {n}"),
+            ));
+        }
+        let mut body = [0u8; 12];
+        read_exact_poll(stream, &mut body[..n], deadline)?;
+        if &body[..4] != MAGIC_START {
+            log::warn!("ignoring unknown command {:?}", &body[..4]);
+            continue; // keep waiting for a valid STRT
+        }
+        // Payload (optional): u32 duration_s, u32 interval_ms (see const docs).
+        let mut dur_s = DEFAULT_DURATION_S;
+        let mut interval_ms = DEFAULT_INTERVAL_MS;
+        if n >= 8 {
+            dur_s = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
+            if dur_s == 0 {
+                dur_s = DEFAULT_DURATION_S;
+            }
+        }
+        if n >= 12 {
+            interval_ms = u32::from_le_bytes(body[8..12].try_into().unwrap()) as u64;
+        }
+        return Ok(Some((dur_s, interval_ms)));
+    }
+}
+
+/// Read exactly `buf.len()` bytes, tolerating WouldBlock (non-blocking socket)
+/// by polling with small delays until `deadline`. Err(UnexpectedEof) on a
+/// clean close, Err(TimedOut) past the deadline.
+fn read_exact_poll(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut got = 0;
+    while got < buf.len() {
+        use std::io::Read;
+        match stream.read(&mut buf[got..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client closed",
+                ))
+            }
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for the laptop command",
+                    ));
+                }
+                FreeRtos::delay_ms(20);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Capture one QXGA frame, 4x4-downsample it into the pipeline's level-0
@@ -216,6 +354,19 @@ fn build_record(buf: &mut Vec<u8>, w: usize, h: usize, frame: &[u8], feats: &[Fe
             buf.extend_from_slice(&word.to_le_bytes());
         }
     }
+}
+
+/// Assemble the VOXD "done mapping" record into `buf`: length | magic |
+/// frames | total features (u32 LE each). Sent once at the end of every map
+/// run so the laptop can cross-check its own receive counts and start COLMAP.
+fn build_done_record(buf: &mut Vec<u8>, frames: u64, features: u64) {
+    // Payload after the u32 length: magic(4) + frames(4) + features(4).
+    let payload = 12;
+    buf.clear();
+    buf.extend_from_slice(&(payload as u32).to_le_bytes());
+    buf.extend_from_slice(MAGIC_DONE);
+    buf.extend_from_slice(&(frames as u32).to_le_bytes());
+    buf.extend_from_slice(&(features as u32).to_le_bytes());
 }
 
 fn send_record(stream: &mut TcpStream, record: &[u8]) -> std::io::Result<()> {

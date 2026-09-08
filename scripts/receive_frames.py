@@ -1,39 +1,7 @@
 #!/usr/bin/env python3
-"""Receive the vo-box-lite **map mode** stream: for each frame save a BMP of
-the original frame with every identified feature drawn as a red dot, plus the
-feature CSV (slam-exp grey-features format, ready for the COLMAP map pipeline).
-
-Wire format — one record per processed frame, as sent by src/bin/main.rs
-map_server()/build_record():
-
-    VOX2 (frame + pyramid features):
-        u32 LE  n        bytes after this field (= 11 + w*h + 41*nfeat)
-        4 B     magic    b"VOX2"
-        u8      format   esp32-camera pixformat id (3 = PIXFORMAT_GRAYSCALE)
-        u16 LE  width    (level-0, i.e. the original frame)
-        u16 LE  height
-        u16 LE  nfeat
-        w*h B   raw gray pixels (the original image frame)
-        nfeat x feature records:
-            u8      level      pyramid level the keypoint came from (0..6)
-            f32 LE  x          level-0 pixel x (local keypoint * 1.2^level)
-            f32 LE  y          level-0 pixel y
-            32 B    descriptor 256-bit rBRIEF (8 x u32 LE, memory order)
-
-    VOX1 (legacy, raw frame only — old firmware):
-        u32 LE  n        (= 9 + w*h) | b"VOX1" | fmt(1) | w(2) | h(2) | pixels
-
-Usage:
-    python3 receive_frames.py --once          # save one frame, then exit
-    python3 receive_frames.py                 # save frames until Ctrl-C
-    python3 receive_frames.py --host 192.168.71.1 --port 5000 --out frames
-
-Each saved VOX2 frame produces <out>/frame_NNNNNN.bmp (original frame,
-8-bit gray), <out>/frame_NNNNNN_marked.bmp (24-bit; features drawn as red
-dots at their level-0 pixel positions) and <out>/frame_NNNNNN.csv (rows:
-x,y,<64 hex chars> — feature index = CSV row, like grey-features/).
-
-The ESP accepts ONE persistent TCP connection — kill any leftover `nc` first.
+"""Map-mode viewer: send STRT to kick a timed map run off the ESP, then save
+every VOX2 frame as <out>/frame_NNNNNN.bmp (+ _marked.bmp overlay and .csv
+features) until the VOXD done record ends the run. Full builder: receive_map.py.
 """
 
 import argparse
@@ -44,6 +12,8 @@ from pathlib import Path
 
 MAGIC_VOX1 = b"VOX1"
 MAGIC_VOX2 = b"VOX2"
+MAGIC_VOXD = b"VOXD"
+MAGIC_STRT = b"STRT"  # laptop -> ESP: kick the map task off
 FMT_GRAYSCALE = 3  # esp32-camera PIXFORMAT_GRAYSCALE
 DOT_RADIUS = 2     # feature marker radius in px
 
@@ -86,7 +56,18 @@ def read_record(conn: socket.socket):
         return "VOX1", payload[4:]
     if magic == MAGIC_VOX2:
         return "VOX2", payload[4:]
+    if magic == MAGIC_VOXD:
+        # payload-after-magic = u32 frames, u32 total features (LE)
+        frames, features = struct.unpack("<II", payload[4:12])
+        return "VOXD", (frames, features)
     raise ValueError(f"bad magic {magic!r} — stream out of sync")
+
+
+def send_start(conn: socket.socket, duration_s: int = 30, interval_ms: int = 1000) -> None:
+    """Kick the ESP's map task off: `u32 LE n` (= 12) | b"STRT" | u32 duration_s
+    | u32 interval_ms. The MCU idles until this arrives (see src/bin/main.rs)."""
+    body = MAGIC_STRT + struct.pack("<II", duration_s, interval_ms)
+    conn.sendall(struct.pack("<I", len(body)) + body)
 
 
 def _bmp_headers(w: int, h: int, pixel_bytes: int, bpp: int) -> bytes:
@@ -166,6 +147,10 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--out", default="frames", help="output directory (created if missing)")
     ap.add_argument("--once", action="store_true", help="save one frame and exit")
+    ap.add_argument("--duration", type=int, default=30,
+                    help="map run length in seconds (sent in the STRT command)")
+    ap.add_argument("--interval", type=int, default=1000,
+                    help="ms between streamed frames (0 = max rate)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -173,10 +158,19 @@ def main() -> int:
 
     print(f"connecting to {args.host}:{args.port} ...")
     with socket.create_connection((args.host, args.port), timeout=10) as conn:
-        print("connected — waiting for map records (Ctrl-C to stop)")
+        # The ESP idles until told to run: kick a map run off, then save
+        # frames until it ends with the VOXD done record.
+        send_start(conn, args.duration, args.interval)
+        print(f"STRT sent: {args.duration}s run at one frame per {args.interval} ms "
+              f"— waiting for frames (Ctrl-C stops early)")
         count = 0
         while True:
             kind, payload = read_record(conn)
+            if kind == "VOXD":
+                frames, features = payload
+                print(f"done-mapping record: {frames} frames / {features} features "
+                      f"({count} saved here); run complete")
+                return 0
             if kind == "VOX1":
                 fmt = payload[0]
                 w, h = struct.unpack("<HH", payload[1:5])
