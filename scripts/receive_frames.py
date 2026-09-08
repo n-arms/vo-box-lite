@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
-"""Receive the vo-box-lite frame stream and save frames as grayscale BMPs.
-
-Wire format — one record per frame, as sent by src/bin/main.rs send_frame():
-    u32 LE  n        bytes following this field (= 9 + w*h)
-    4 B     magic    b"VOX1"
-    u8      format   esp32-camera pixformat id (3 = PIXFORMAT_GRAYSCALE)
-    u16 LE  width
-    u16 LE  height
-    n-9 B   raw pixel bytes (grayscale: 1 byte/px, row-major)
-
-Usage:
-    python3 receive_frames.py --once          # save a single frame, then exit
-    python3 receive_frames.py                 # save frames until Ctrl-C
-    python3 receive_frames.py --host 192.168.71.1 --port 5000 --out frames
-
-The ESP accepts ONE persistent TCP connection — kill any leftover `nc` first.
+"""Map-mode viewer: send STRT to kick a timed map run off the ESP, then save
+every VOX2 frame as <out>/frame_NNNNNN.bmp (+ _marked.bmp overlay and .csv
+features) until the VOXD done record ends the run. Full builder: receive_map.py.
 """
 
 import argparse
@@ -23,9 +10,12 @@ import struct
 import sys
 from pathlib import Path
 
-MAGIC = b"VOX1"
+MAGIC_VOX1 = b"VOX1"
+MAGIC_VOX2 = b"VOX2"
+MAGIC_VOXD = b"VOXD"
+MAGIC_STRT = b"STRT"  # laptop -> ESP: kick the map task off
 FMT_GRAYSCALE = 3  # esp32-camera PIXFORMAT_GRAYSCALE
-# Fmt byte maps to camera pixformat ids: 1=YUV422 2=YUV420 3=GRAYSCALE 4=JPEG ...
+DOT_RADIUS = 2     # feature marker radius in px
 
 
 def read_exact(conn: socket.socket, n: int) -> bytes:
@@ -38,36 +28,117 @@ def read_exact(conn: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
-def read_record(conn: socket.socket) -> tuple[int, int, int, bytes]:
-    """Block until one full frame record arrives; return (fmt, w, h, pixels)."""
+def parse_vox2(payload: bytes):
+    """Parse a VOX2 payload (after magic): returns (fmt, w, h, pixels, feats)
+    where feats = list of (level, x, y, desc_bytes). x/y are level-0 pixels."""
+    fmt = payload[0]
+    w, h, nfeat = struct.unpack("<HHH", payload[1:7])
+    off = 7
+    pixels = payload[off:off + w * h]
+    off += w * h
+    feats = []
+    for _ in range(nfeat):
+        (level,) = struct.unpack("<B", payload[off:off + 1])
+        (x, y) = struct.unpack("<ff", payload[off + 1:off + 9])
+        desc = payload[off + 9:off + 41]
+        off += 41
+        feats.append((level, x, y, desc))
+    return fmt, w, h, pixels, feats
+
+
+def read_record(conn: socket.socket):
+    """Block until one full record arrives; returns (kind, payload-after-magic)
+    with kind "VOX1" or "VOX2"."""
     (n,) = struct.unpack("<I", read_exact(conn, 4))
     payload = read_exact(conn, n)
-    if payload[:4] != MAGIC:
-        raise ValueError(f"bad magic {payload[:4]!r} (expected {MAGIC!r}) — stream out of sync")
-    fmt = payload[4]
-    w, h = struct.unpack("<HH", payload[5:9])
-    pixels = payload[9:]
-    if len(pixels) != w * h:
-        raise ValueError(f"frame size mismatch: {len(pixels)} px vs {w}x{h}")
-    return fmt, w, h, pixels
+    magic = payload[:4]
+    if magic == MAGIC_VOX1:
+        return "VOX1", payload[4:]
+    if magic == MAGIC_VOX2:
+        return "VOX2", payload[4:]
+    if magic == MAGIC_VOXD:
+        # payload-after-magic = u32 frames, u32 total features (LE)
+        frames, features = struct.unpack("<II", payload[4:12])
+        return "VOXD", (frames, features)
+    raise ValueError(f"bad magic {magic!r} — stream out of sync")
+
+
+def send_start(conn: socket.socket, duration_s: int = 30, interval_ms: int = 1000) -> None:
+    """Kick the ESP's map task off: `u32 LE n` (= 12) | b"STRT" | u32 duration_s
+    | u32 interval_ms. The MCU idles until this arrives (see src/bin/main.rs)."""
+    body = MAGIC_STRT + struct.pack("<II", duration_s, interval_ms)
+    conn.sendall(struct.pack("<I", len(body)) + body)
+
+
+def _bmp_headers(w: int, h: int, pixel_bytes: int, bpp: int) -> bytes:
+    """Common 24/8-bit BMP file header + DIB header. bpp = 24 or 8."""
+    palette_off = 14 + 40 if bpp == 24 else 14 + 40 + 1024
+    file_size = palette_off + pixel_bytes
+    header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, palette_off)
+    info = struct.pack(
+        "<IiiHHIIiiII", 40, w, h, 1, bpp, 0, pixel_bytes, 2835, 2835,
+        256 if bpp == 8 else 0, 0,
+    )
+    return header + info
 
 
 def write_gray_bmp(path: Path, w: int, h: int, pixels: bytes) -> None:
-    """8-bit grayscale BMP: 14 B file hdr + 40 B info hdr + 256-entry palette
-    + bottom-up rows, each padded to a multiple of 4 bytes."""
+    """8-bit grayscale BMP (legacy VOX1 frames): 14 B file hdr + 40 B info hdr
+    + 256-entry palette + bottom-up rows, each padded to a multiple of 4 B."""
     row_pad = (4 - (w % 4)) % 4
     stride = w + row_pad
     rows = [pixels[y * w:(y + 1) * w] + b"\x00" * row_pad for y in reversed(range(h))]
     pixel_data = b"".join(rows)
-
-    palette_off = 14 + 40
-    file_size = palette_off + 1024 + len(pixel_data)
-    header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, palette_off)
-    info = struct.pack(
-        "<IiiHHIIiiII", 40, w, h, 1, 8, 0, len(pixel_data), 2835, 2835, 256, 0
-    )
     palette = b"".join(bytes((i, i, i, 0)) for i in range(256))
-    path.write_bytes(header + info + palette + pixel_data)
+    path.write_bytes(_bmp_headers(w, h, len(pixel_data), 8) + palette + pixel_data)
+
+
+def feature_dots(w: int, h: int, feats) -> set:
+    """Level-0 pixel positions of every feature, as a set of (x, y) ints.
+    Border keypoints are dropped on the S3, but clamp defensively anyway."""
+    dots = set()
+    for (_level, x, y, _desc) in feats:
+        cx, cy = int(round(x)), int(round(y))
+        if not (0 <= cx < w and 0 <= cy < h):
+            continue
+        for dy in range(-DOT_RADIUS, DOT_RADIUS + 1):
+            for dx in range(-DOT_RADIUS, DOT_RADIUS + 1):
+                if dx * dx + dy * dy <= DOT_RADIUS * DOT_RADIUS:
+                    px, py = cx + dx, cy + dy
+                    if 0 <= px < w and 0 <= py < h:
+                        dots.add((px, py))
+    return dots
+
+
+def write_marked_bmp(path: Path, w: int, h: int, gray: bytes, feats) -> None:
+    """24-bit BMP of the frame with each feature drawn as a red dot (BGR
+    (0,0,255)) at its level-0 pixel position. Bottom-up rows, 4-B padded."""
+    dots = feature_dots(w, h, feats)
+    row_pad = (4 - (w * 3) % 4) % 4
+    stride = w * 3 + row_pad
+    pixel_data = bytearray()
+    for y in reversed(range(h)):
+        row = bytearray(stride)
+        base = y * w
+        for x in range(w):
+            v = gray[base + x]
+            if (x, y) in dots:
+                row[x * 3:x * 3 + 3] = b"\x00\x00\xff"  # red
+            else:
+                row[x * 3] = v  # B
+                row[x * 3 + 1] = v  # G
+                row[x * 3 + 2] = v  # R
+        pixel_data += row
+    path.write_bytes(_bmp_headers(w, h, len(pixel_data), 24) + bytes(pixel_data))
+
+
+def write_feature_csv(path: Path, feats) -> None:
+    """slam-exp grey-features format: `x.xx,y.yy,<64 hex>` per row (no header;
+    feature index = row number). x/y are level-0 pixel coords from the S3."""
+    lines = []
+    for (_level, x, y, desc) in feats:
+        lines.append(f"{x:.2f},{y:.2f},{desc.hex()}")
+    path.write_text("\n".join(lines) + "\n")
 
 
 def main() -> int:
@@ -76,6 +147,10 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--out", default="frames", help="output directory (created if missing)")
     ap.add_argument("--once", action="store_true", help="save one frame and exit")
+    ap.add_argument("--duration", type=int, default=30,
+                    help="map run length in seconds (sent in the STRT command)")
+    ap.add_argument("--interval", type=int, default=1000,
+                    help="ms between streamed frames (0 = max rate)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -83,17 +158,45 @@ def main() -> int:
 
     print(f"connecting to {args.host}:{args.port} ...")
     with socket.create_connection((args.host, args.port), timeout=10) as conn:
-        print("connected — waiting for frames (Ctrl-C to stop)")
+        # The ESP idles until told to run: kick a map run off, then save
+        # frames until it ends with the VOXD done record.
+        send_start(conn, args.duration, args.interval)
+        print(f"STRT sent: {args.duration}s run at one frame per {args.interval} ms "
+              f"— waiting for frames (Ctrl-C stops early)")
         count = 0
         while True:
-            fmt, w, h, pixels = read_record(conn)
-            if fmt != FMT_GRAYSCALE:
-                print(f"frame {count}: unsupported pixel format id {fmt} (only grayscale=3 handled), skipping")
-                continue
-            count += 1
-            path = out / f"frame_{count:06d}.bmp"
-            write_gray_bmp(path, w, h, pixels)
-            print(f"saved {path} ({w}x{h}, {len(pixels)} px)")
+            kind, payload = read_record(conn)
+            if kind == "VOXD":
+                frames, features = payload
+                print(f"done-mapping record: {frames} frames / {features} features "
+                      f"({count} saved here); run complete")
+                return 0
+            if kind == "VOX1":
+                fmt = payload[0]
+                w, h = struct.unpack("<HH", payload[1:5])
+                pixels = payload[5:]
+                if fmt != FMT_GRAYSCALE or len(pixels) != w * h:
+                    print(f"frame {count}: bad VOX1 (fmt {fmt}, {len(pixels)}px vs {w}x{h}), skipping")
+                    continue
+                count += 1
+                write_gray_bmp(out / f"frame_{count:06d}.bmp", w, h, pixels)
+                print(f"saved {out}/frame_{count:06d}.bmp ({w}x{h}) [legacy VOX1]")
+            else:  # VOX2
+                fmt, w, h, pixels, feats = parse_vox2(payload)
+                if fmt != FMT_GRAYSCALE or len(pixels) != w * h:
+                    print(f"frame {count}: bad VOX2 (fmt {fmt}), skipping")
+                    continue
+                count += 1
+                stem = out / f"frame_{count:06d}"
+                # Original frame (clean) + labeled frame (features as red dots)
+                # + feature CSV.
+                write_gray_bmp(Path(str(stem) + ".bmp"), w, h, pixels)
+                write_marked_bmp(Path(str(stem) + "_marked.bmp"), w, h, pixels, feats)
+                write_feature_csv(Path(str(stem) + ".csv"), feats)
+                print(
+                    f"saved {stem}.bmp + {stem}_marked.bmp ({w}x{h}, "
+                    f"{len(feats)} features as red dots) + .csv"
+                )
             if args.once:
                 return 0
 

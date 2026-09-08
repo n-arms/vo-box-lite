@@ -23,6 +23,14 @@ fn circle_offsets(stride: usize) -> [isize; 16] {
     o
 }
 
+/// Exact FAST-12 rule at center index `c` (center value `v`): 12 contiguous
+/// circle pixels strictly brighter than v+b, or strictly darker than v-b.
+/// Shared by detect and score so both use the same predicate.
+#[inline(always)]
+fn corner_at(im: &[u8], c: isize, off: &[isize; 16], v: i32, b: i32) -> bool {
+    trees::light(im, c, off, v + b) || trees::dark(im, c, off, v - b)
+}
+
 /// FAST-12 corners of `im` (row pitch `stride`), row-major, same interior
 /// scan as fast.c (y/x in 3..size-3). Needs stride >= w and im.len() >=
 /// (h-1)*stride + w. Returns the total corner count; `out` is a store cap.
@@ -44,7 +52,7 @@ pub fn fast12_detect(
         for x in 3..w - 3 {
             let c = (y * stride + x) as isize;
             let v = im[c as usize] as i32;
-            if trees::light(im, c, &off, v + b) || trees::dark(im, c, &off, v - b) {
+            if corner_at(im, c, &off, v, b) {
                 if n < out.len() {
                     out[n] = Corner { x, y };
                 }
@@ -53,6 +61,202 @@ pub fn fast12_detect(
         }
     }
     n
+}
+
+/// FAST score of one corner: the largest threshold b at which the pixel is
+/// still a corner, binary-searched over [bstart, 255] exactly like fast.c's
+/// fast12_corner_score() (same 12-contiguous predicate, same search, so the
+/// score is bit-identical). The pixel is assumed to be a corner at `bstart`
+/// (it came from the detector) — that is the search's lower bound.
+#[inline]
+fn corner_score(im: &[u8], c: isize, off: &[isize; 16], v: i32, bstart: i32) -> i32 {
+    let mut bmin = bstart;
+    let mut bmax = 255i32;
+    let mut b = (bmin + bmax) / 2;
+    loop {
+        if corner_at(im, c, off, v, b) {
+            bmin = b;
+        } else {
+            bmax = b;
+        }
+        if bmin == bmax - 1 || bmin == bmax {
+            return bmin;
+        }
+        b = (bmin + bmax) / 2;
+    }
+}
+
+/// FAST scores of a raster-ordered corner list (one i32 per corner), mirroring
+/// fast.c's fast12_score(): score[n] = largest threshold at which corner n is
+/// still a corner, binary-searched from `b` up to 255. `corners` must have
+/// come from [`fast12_detect`] on `im` at threshold `b` (same stride). Writes
+/// min(corners.len(), scores.len()) scores; returns how many were written.
+pub fn fast12_score(
+    im: &[u8],
+    stride: usize,
+    corners: &[Corner],
+    b: i32,
+    scores: &mut [i32],
+) -> usize {
+    let n = corners.len().min(scores.len());
+    if n == 0 {
+        return 0;
+    }
+    debug_assert!(im.len() >= (corners[n - 1].y * stride + corners[n - 1].x) + 3 * stride + 3);
+    let off = circle_offsets(stride);
+    for i in 0..n {
+        let c = (corners[i].y * stride + corners[i].x) as isize;
+        scores[i] = corner_score(im, c, &off, im[c as usize] as i32, b);
+    }
+    n
+}
+
+/// Non-max suppression over a raster-ordered, scored corner list — a direct
+/// port of fast.c's nonmax_suppression() (same algorithm and guard structure,
+/// same >= rule: a corner dies if any 3x3 neighbour — left/right on its own
+/// row, x in {x-1,x,x+1} on the row above/below — has score >= its own, so
+/// equal-score neighbours mutually suppress). no_std + alloc-free: `rowidx`
+/// is caller scratch with one entry per corner row index (>= the last corner's
+/// y + 1), and survivors are appended to `out` in raster order.
+///
+/// Input contract (do not break): `corners` in raster-scan order (y asc, x
+/// asc within a row — as emitted by [`fast12_detect`]) with `scores[i]` its
+/// score. Returns the total survivor count (stored into `out` up to its
+/// length, first K survivors in order — a truncated store, like
+/// [`fast12_detect`]). Returns 0 and writes nothing if `corners` is empty or
+/// `scores`/`rowidx` are undersized.
+pub fn nonmax_suppression(
+    corners: &[Corner],
+    scores: &[i32],
+    rowidx: &mut [usize],
+    out: &mut [Corner],
+) -> usize {
+    let sz = corners.len();
+    if sz == 0 || scores.len() < sz {
+        return 0;
+    }
+    let last_row = corners[sz - 1].y;
+    if rowidx.len() <= last_row {
+        return 0;
+    }
+    // Row index: row_start[y] = index of the first corner on row y, or
+    // usize::MAX if that row has none. Corners are raster-ordered so each
+    // row's corners are contiguous and one pass suffices.
+    for r in rowidx.iter_mut().take(last_row + 1) {
+        *r = usize::MAX;
+    }
+    let mut prev_row = usize::MAX;
+    for (i, c) in corners.iter().enumerate() {
+        if c.y != prev_row {
+            rowidx[c.y] = i;
+            prev_row = c.y;
+        }
+    }
+    // Monotonic row cursors (never reset) keep each row's window scan
+    // amortized O(1); total cursor movement over the pass is O(n).
+    let (mut point_above, mut point_below) = (0usize, 0usize);
+    let mut num_nonmax = 0;
+    'corner: for i in 0..sz {
+        let score = scores[i];
+        let pos = corners[i];
+        let px = pos.x as isize;
+        // Left: raster order => the only same-row left neighbour is i-1.
+        if i > 0 {
+            let l = corners[i - 1];
+            if l.y == pos.y && l.x as isize == px - 1 && scores[i - 1] >= score {
+                continue 'corner;
+            }
+        }
+        // Right: the only same-row right neighbour is i+1.
+        if i + 1 < sz {
+            let r = corners[i + 1];
+            if r.y == pos.y && r.x as isize == px + 1 && scores[i + 1] >= score {
+                continue 'corner;
+            }
+        }
+        // Above: only if row pos.y-1 exists and has corners.
+        if pos.y != 0 && rowidx[pos.y - 1] != usize::MAX {
+            // Snap the cursor onto the row above if it fell behind it.
+            if corners[point_above].y < pos.y - 1 {
+                point_above = rowidx[pos.y - 1];
+            }
+            // Advance past corners left of the 3-wide window (rows strictly
+            // above; stops at the current row at the latest, so in-bounds).
+            while corners[point_above].y < pos.y && (corners[point_above].x as isize) < px - 1 {
+                point_above += 1;
+            }
+            let mut j = point_above;
+            while corners[j].y < pos.y && corners[j].x as isize <= px + 1 {
+                let x = corners[j].x as isize;
+                if (x == px - 1 || x == px || x == px + 1) && scores[j] >= score {
+                    continue 'corner;
+                }
+                j += 1;
+            }
+        }
+        // Below: only if row pos.y+1 exists and has corners and the cursor
+        // is not past the end of the list.
+        if pos.y != last_row && rowidx[pos.y + 1] != usize::MAX && point_below < sz {
+            if corners[point_below].y < pos.y + 1 {
+                point_below = rowidx[pos.y + 1];
+            }
+            while point_below < sz
+                && corners[point_below].y == pos.y + 1
+                && (corners[point_below].x as isize) < px - 1
+            {
+                point_below += 1;
+            }
+            let mut j = point_below;
+            while j < sz && corners[j].y == pos.y + 1 && corners[j].x as isize <= px + 1 {
+                let x = corners[j].x as isize;
+                if (x == px - 1 || x == px || x == px + 1) && scores[j] >= score {
+                    continue 'corner;
+                }
+                j += 1;
+            }
+        }
+
+        if num_nonmax < out.len() {
+            out[num_nonmax] = corners[i];
+        }
+        num_nonmax += 1;
+    }
+    num_nonmax
+}
+
+/// Detect -> score -> non-max suppression in one call: the Rust equivalent of
+/// fast.c's fast12_detect_nonmax(). Returns the surviving corners (raster
+/// order) and their count; `out` is a store cap, like [`fast12_detect`].
+/// Scratch: `corners` holds the raw candidates (must fit the FULL raw list
+/// for exact NMS — if the detector finds more, only the first `corners.len()`
+/// raster corners, i.e. the top of the image, are scored and suppressed),
+/// `scores` >= corners.len() i32s, `rowidx` >= image rows (see
+/// [`nonmax_suppression`]). Returns 0 for no corners or undersized scratch.
+pub fn fast12_detect_nonmax(
+    im: &[u8],
+    w: usize,
+    h: usize,
+    stride: usize,
+    b: i32,
+    corners: &mut [Corner],
+    scores: &mut [i32],
+    rowidx: &mut [usize],
+    out: &mut [Corner],
+) -> usize {
+    if corners.is_empty() || scores.is_empty() || rowidx.is_empty() || out.is_empty() {
+        return 0;
+    }
+    let nraw = fast12_detect(im, w, h, stride, b, corners);
+    if nraw == 0 {
+        return 0;
+    }
+    let n = fast12_score(im, stride, &corners[..nraw.min(corners.len())], b, scores);
+    nonmax_suppression(
+        &corners[..n],
+        &scores[..n],
+        rowidx,
+        out,
+    )
 }
 
 // ---------------------------------------------------------------- tests ----
@@ -198,5 +402,166 @@ mod tests {
         check(&im, 96, 72, 96, 20, CAP, "cap 5");
         let n = fast12_detect(&im, 96, 72, 96, 20, &mut [Corner { x: 0, y: 0 }; CAP]);
         assert!(n > CAP, "need > {CAP} corners, got {n}"); // returned = total
+    }
+
+    // ---- score + non-max suppression ----
+
+    /// Independent score reference: largest b in [bstart, 255] at which the
+    /// exact 12-contiguous rule (rotation loop, not the trees) still fires.
+    fn naive_score(im: &[u8], c: isize, off: &[isize; 16], bstart: i32) -> i32 {
+        let v = im[c as usize] as i32;
+        for b in (bstart..=255).rev() {
+            if is_corner(im, c, off, v + b, v - b) {
+                return b;
+            }
+        }
+        bstart // no threshold >= bstart fires (impl returns its lower bound too)
+    }
+
+    /// Independent NMS reference: a corner dies if ANY other corner within its
+    /// 3x3 neighbourhood has score >= its own (the C >= rule; no raster-order
+    /// shortcuts).
+    fn naive_nonmax(corners: &[Corner], scores: &[i32]) -> Vec<Corner> {
+        let mut out = Vec::new();
+        'i: for (i, c) in corners.iter().enumerate() {
+            for (j, o) in corners.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let dx = o.x as isize - c.x as isize;
+                let dy = o.y as isize - c.y as isize;
+                if dx.abs() <= 1 && dy.abs() <= 1 && scores[j] >= scores[i] {
+                    continue 'i;
+                }
+            }
+            out.push(*c);
+        }
+        out
+    }
+
+    /// Detect (full list), score both ways, NMS both ways — all must agree.
+    fn score_nms_case(im: &[u8], w: usize, h: usize, stride: usize, b: i32, label: &str) {
+        const CAP: usize = 16384;
+        let mut det = vec![Corner { x: 0, y: 0 }; CAP];
+        let nraw = fast12_detect(im, w, h, stride, b, &mut det);
+        assert!(nraw <= CAP, "{label}: raw {nraw} exceeds CAP");
+        let det = &det[..nraw];
+
+        let off = circle_offsets(stride);
+        let mut s_impl = vec![0i32; nraw];
+        assert_eq!(
+            fast12_score(im, stride, det, b, &mut s_impl),
+            nraw,
+            "{label}: score count"
+        );
+        let s_naive: Vec<i32> = det
+            .iter()
+            .map(|c| naive_score(im, (c.y * stride + c.x) as isize, &off, b))
+            .collect();
+        assert_eq!(s_impl, s_naive, "{label}: scores");
+
+        let mut rowidx = vec![usize::MAX; h]; // h >= last corner row + 1
+        let mut nm = vec![Corner { x: 0, y: 0 }; CAP];
+        let nnm = nonmax_suppression(det, &s_impl, &mut rowidx, &mut nm);
+        let naive = naive_nonmax(det, &s_impl);
+        assert_eq!(nnm, naive.len(), "{label}: nms count");
+        assert_eq!(&nm[..nnm], naive.as_slice(), "{label}: nms corners");
+    }
+
+    #[test]
+    fn score_and_nms_match_naive_reference() {
+        for (w, h, stride) in [
+            (64usize, 48usize, 64usize),
+            (97, 63, 97),      // odd dims
+            (60, 44, 128),     // padded stride
+            (127, 95, 127),    // dense 4x4 dots, strong corners at every t
+            (33, 17, 33),
+        ] {
+            let dots = w == 127 && h == 95;
+            let im = if dots {
+                // Bright 4x4 blocks on a dark grid: ~2000 corners/level.
+                let mut v = vec![0u8; w * h];
+                for (i, p) in v.iter_mut().enumerate() {
+                    *p = if (i % w % 8) < 4 && (i / w % 8) < 4 { 200 } else { 40 };
+                }
+                v
+            } else {
+                let seed = 0x243F_6A88_85A3_08D3 ^ ((w as u64) << 32)
+                    ^ ((h as u64) << 16) ^ (stride as u64);
+                rand_img(w, h, stride, seed)
+            };
+            for b in [8i32, 20, 40] {
+                score_nms_case(&im, w, h, stride, b, &format!("{w}x{h} s{stride} b{b}"));
+            }
+        }
+    }
+
+    #[test]
+    fn nms_edge_cases() {
+        let mut rowidx = [usize::MAX; 64];
+        let mut out = [Corner { x: 0, y: 0 }; 64];
+        // Empty input -> 0 survivors, no writes.
+        assert_eq!(nonmax_suppression(&[], &[], &mut rowidx, &mut out), 0);
+        // Undersized scores / rowidx -> 0.
+        let c1 = [Corner { x: 10, y: 10 }];
+        assert_eq!(nonmax_suppression(&c1, &[], &mut rowidx, &mut out), 0);
+        let mut short = [usize::MAX; 10]; // last_row 10 needs len >= 11
+        assert_eq!(nonmax_suppression(&c1, &[60], &mut short, &mut out), 0);
+        // Single corner always survives.
+        assert_eq!(nonmax_suppression(&c1, &[60], &mut rowidx, &mut out), 1);
+        assert_eq!(out[0], c1[0]);
+        // Equal adjacent scores mutually suppress (the C >= rule, verbatim).
+        let row = [Corner { x: 10, y: 10 }, Corner { x: 11, y: 10 }];
+        assert_eq!(nonmax_suppression(&row, &[60, 60], &mut rowidx, &mut out), 0);
+        // Unequal: only the weaker dies (right neighbour >= rule).
+        assert_eq!(nonmax_suppression(&row, &[60, 40], &mut rowidx, &mut out), 1);
+        assert_eq!(out[0], row[0]);
+        assert_eq!(nonmax_suppression(&row, &[40, 60], &mut rowidx, &mut out), 1);
+        assert_eq!(out[0], row[1]);
+        // Vertical and diagonal neighbours count (3-wide window, dx <= 1).
+        let col = [Corner { x: 10, y: 10 }, Corner { x: 10, y: 11 }];
+        assert_eq!(nonmax_suppression(&col, &[60, 60], &mut rowidx, &mut out), 0);
+        let diag = [Corner { x: 10, y: 10 }, Corner { x: 11, y: 11 }];
+        assert_eq!(nonmax_suppression(&diag, &[40, 60], &mut rowidx, &mut out), 1);
+        assert_eq!(out[0], diag[1]);
+        assert_eq!(nonmax_suppression(&diag, &[60, 60], &mut rowidx, &mut out), 0);
+        // Two corners of the same row far apart both survive.
+        let far = [Corner { x: 10, y: 10 }, Corner { x: 30, y: 10 }];
+        assert_eq!(nonmax_suppression(&far, &[40, 60], &mut rowidx, &mut out), 2);
+        // Out store is a cap: survivors past out.len() are counted, not stored.
+        let mut tiny = [Corner { x: 0, y: 0 }; 1];
+        assert_eq!(
+            nonmax_suppression(&far, &[40, 60], &mut rowidx, &mut tiny),
+            2
+        );
+        assert_eq!(tiny[0], far[0]);
+    }
+
+    #[test]
+    fn detect_nonmax_wrapper_matches_manual() {
+        for (w, h, stride) in [(96usize, 72usize, 96usize), (60, 44, 128)] {
+            let im = rand_img(w, h, stride, 0xBADC_0FFE ^ ((w as u64) << 32) ^ (h as u64));
+            for b in [8i32, 20, 40] {
+                let label = format!("{w}x{h} s{stride} b{b}");
+                const CAP: usize = 8192;
+                let mut corners = vec![Corner { x: 0, y: 0 }; CAP];
+                let mut scores = vec![0i32; CAP];
+                let mut rowidx = vec![usize::MAX; h];
+                let mut out = vec![Corner { x: 0, y: 0 }; CAP];
+                let nn = fast12_detect_nonmax(
+                    &im, w, h, stride, b, &mut corners, &mut scores, &mut rowidx, &mut out,
+                );
+                // Manual composition on the same scratch.
+                let nraw = fast12_detect(&im, w, h, stride, b, &mut corners);
+                assert!(nraw <= CAP, "{label}: raw {nraw}");
+                let n = fast12_score(&im, stride, &corners[..nraw], b, &mut scores);
+                let n2 = nonmax_suppression(&corners[..n], &scores[..n], &mut rowidx, &mut out);
+                assert_eq!(nn, n2, "{label}: wrapper vs manual count");
+                assert!(nn > 0, "{label}: expected survivors");
+                let naive = naive_nonmax(&corners[..n], &scores[..n]);
+                assert_eq!(nn, naive.len(), "{label}: vs naive count");
+                assert_eq!(&out[..nn], naive.as_slice(), "{label}: vs naive corners");
+            }
+        }
     }
 }

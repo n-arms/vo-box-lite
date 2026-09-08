@@ -1,12 +1,13 @@
-//! SoftAP + TCP frame-stream server: esp-idf-svc SoftAP → camera (PSRAM fb) →
-//! TCP server on 0.0.0.0:5000, one persistent laptop connection until it drops.
-//! Wire format (VOX1 length-prefixed records): see scripts/receive_frames.py.
+//! SoftAP + TCP map-task server: the MCU idles until the laptop sends an STRT
+//! command, then streams VOX2 frame+feature records at the requested pace for
+//! the requested duration and ends with a VOXD "done" record (see receive_map).
 
 #[path = "../camera.rs"]
 mod camera;
 
 use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::peripherals::Peripherals;
@@ -14,6 +15,9 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::EspError;
 use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, BlockingWifi, Configuration, EspWifi};
+use vo_box_lite::downscale;
+use vo_box_lite::fast;
+use vo_box_lite::pyramid::{self, Feature};
 
 /// SoftAP credentials the laptop joins with (WPA2 passphrase must be >= 8 chars).
 const AP_SSID: &str = "vo-box";
@@ -21,13 +25,32 @@ const AP_PASS: &str = "vobox1234"; // TODO: real passphrase
 const TCP_PORT: u16 = 5000;
 /// IDF v5.5 default AP IP; fallback if the netif-up poll times out.
 const AP_IP_FALLBACK: Ipv4Addr = Ipv4Addr::new(192, 168, 71, 1);
+/// Command magic laptop -> MCU, sent right after connect: `u32 LE n | "STRT"`
+/// [+ payload]. The MCU streams nothing until STRT arrives.
+const MAGIC_START: &[u8; 4] = b"STRT";
+/// STRT payload defaults (the command can override; see read_start_command):
+/// 30 s run, one frame per 1000 ms (0 = max rate), 60 s STRT timeout.
+const DEFAULT_DURATION_S: u64 = 30;
+const DEFAULT_INTERVAL_MS: u64 = 1000;
+const START_TIMEOUT_S: u64 = 60;
+/// Record magic for the final "done mapping" record.
+const MAGIC_DONE: &[u8; 4] = b"VOXD";
+/// Record magic for frame+features (VOX2).
+const MAGIC: &[u8; 4] = b"VOX2";
+/// esp32-camera PIXFORMAT_GRAYSCALE (the only format we configure).
+const FMT_GRAYSCALE: u8 = 3;
+/// Sensor resolution: the largest grayscale the OV3660 supports. The engine
+/// downsamples 4x4 to `level-0` dims, so the pyramid/upload budget is small
+/// while the capture keeps full sensor detail (see map_frame).
+const CAM_W: usize = 2048;
+const CAM_H: usize = 1536;
 
 fn main() -> Result<(), EspError> {
     // Required once: links the esp-idf runtime patches (esp-idf-template#71).
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    log::info!("=== vo-box-lite uplink: SoftAP + TCP frame server ===");
+    log::info!("=== vo-box-lite: feature stream (QXGA 2048x1536 -> 4x4 -> 512x384 pyramid) ===");
 
     // ---- SoftAP: WIFI_MODE_AP, no STA ----
     let peripherals = Peripherals::take()?;
@@ -62,10 +85,11 @@ fn main() -> Result<(), EspError> {
     };
     log::info!("SoftAP \"{AP_SSID}\" up — connect to {ap_ip}:{TCP_PORT} from the laptop");
 
-    // ---- Camera: optional, TCP still works without it ----
-    let camera = match camera::Camera::init(&camera::CameraConfig::with_pins(
-        camera::CameraPins::FREENOVE_ESP32S3_WROOM,
-    )) {
+    // ---- Camera: optional, the TCP server still comes up without it ----
+    let camera = match camera::Camera::init(&camera::CameraConfig {
+        frame_size: camera::FrameSize::Qxga, // 2048x1536 gray (CAM_W x CAM_H)
+        ..camera::CameraConfig::with_pins(camera::CameraPins::FREENOVE_ESP32S3_WROOM)
+    }) {
         Ok(cam) => {
             log::info!("camera ready");
             Some(cam)
@@ -76,16 +100,21 @@ fn main() -> Result<(), EspError> {
         }
     };
 
-    // ---- TCP server ----
+    // ---- TCP server (feature stream: capture + downsample + pyramid + upload) ----
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, TCP_PORT))
         .expect("TCP bind 0.0.0.0:5000 failed");
     log::info!("listening on 0.0.0.0:{TCP_PORT}");
 
-    serve(listener, camera.as_ref())
+    feature_server(listener, camera.as_ref())
 }
 
-/// Serve one persistent connection at a time until it drops, then re-accept.
-fn serve(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
+/// Serve one connection = one map run: wait for the laptop's STRT command,
+/// stream paced VOX2 frames until the run deadline, then send the VOXD done
+/// record and drop the connection (re-accept for the next run).
+fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
+    // Pipeline buffers are sized for the downsampled level-0 dims and reused
+    // every frame (no per-frame allocation; see pyramid::extract_pyramid).
+    let mut pipe: Option<MapPipeline> = None;
     loop {
         let (mut stream, peer) = match listener.accept() {
             Ok(conn) => conn,
@@ -95,49 +124,318 @@ fn serve(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                 continue;
             }
         };
-        log::info!("laptop connected: {peer}");
+        log::info!("laptop connected: {peer} — waiting for its STRT command");
+        if pipe.is_none() {
+            pipe = Some(MapPipeline::new(CAM_W, CAM_H));
+        }
+        let p = pipe.as_mut().unwrap();
 
+        // Idle until the laptop kicks the map task off (streams nothing
+        // before that). Clean disconnect -> Ok(None); timeout/garbage -> Err.
+        let (dur_s, interval_ms) = match read_start_command(&mut stream) {
+            Ok(Some(params)) => params,
+            Ok(None) => {
+                log::info!("client {peer} disconnected before sending STRT");
+                continue;
+            }
+            Err(e) => {
+                log::warn!("waiting for STRT from {peer} failed ({e}); dropping");
+                continue;
+            }
+        };
+        // Command phase used non-blocking reads; stream writes must block
+        // again (a WouldBlock on a 200 KB VOX2 frame would look like a drop).
+        if let Err(e) = stream.set_nonblocking(false) {
+            log::warn!("set_nonblocking(false) failed ({e}); dropping client");
+            continue;
+        }
+
+        log::info!("starting a {dur_s}s map run for {peer} (frame every {interval_ms} ms)");
+        let run_start = Instant::now();
+        let deadline = run_start + Duration::from_secs(dur_s);
         let mut sent = 0u64;
-        loop {
-            // capture() blocks until the next frame is ready, pacing the stream.
-            let frame = match camera {
-                Some(cam) => match cam.capture() {
-                    Some(f) => f,
-                    None => {
-                        log::warn!("capture() returned no frame");
-                        FreeRtos::delay_ms(200);
-                        continue;
-                    }
-                },
+        let mut feats_sent = 0u64;
+        let mut interrupted = false; // laptop dropped mid-run
+        while Instant::now() < deadline {
+            let frame_start = Instant::now();
+            let cam = match camera {
+                Some(cam) => cam,
                 None => {
                     FreeRtos::delay_ms(200); // camera down: idle, keep the connection
                     continue;
                 }
             };
 
-            if let Err(e) = send_frame(&mut stream, &frame) {
-                log::info!("client {peer} disconnected ({e}); re-accepting");
+            if let Err(e) = map_frame(cam, p) {
+                log::warn!("map_frame failed ({e})");
+                FreeRtos::delay_ms(200);
+                continue;
+            }
+            // Send the assembled VOX2 record (downsampled frame + features).
+            if send_record(&mut stream, &p.tx).is_err() {
+                interrupted = true;
                 break;
             }
             sent += 1;
-            if sent % 30 == 0 {
-                log::info!("streamed {sent} frames to {peer}");
+            feats_sent += p.last_n as u64;
+            if interval_ms > 0 {
+                log::info!(
+                    "run frame {sent} @ {}s — {} features",
+                    run_start.elapsed().as_secs(),
+                    p.last_n
+                );
+            } else if sent % 20 == 0 {
+                log::info!("streamed {sent} frames to {peer} ({} features/frame)", p.last_n);
             }
+
+            // Pace to one frame per `interval_ms` (capture + pyramid + upload
+            // time counts towards the interval; 0 = as fast as possible).
+            let wait_ms = interval_ms.saturating_sub(frame_start.elapsed().as_millis() as u64);
+            if wait_ms > 0 {
+                FreeRtos::delay_ms(wait_ms as u32);
+            }
+        }
+
+        if !interrupted {
+            // Deadline reached: tell the laptop the run is done, then drop the
+            // connection (it runs COLMAP on the frames it received).
+            build_done_record(&mut p.tx, sent, feats_sent);
+            if let Err(e) = send_record(&mut stream, &p.tx) {
+                log::warn!("done record send failed ({e})");
+            } else {
+                log::info!("map run complete: {sent} frames / {feats_sent} features -> {peer}; VOXD done record sent");
+            }
+        } else {
+            log::info!(
+                "client {peer} disconnected mid-run after {sent} frames; re-accepting"
+            );
         }
     }
 }
 
-/// Write one frame record (wire format documented in scripts/receive_frames.py).
-fn send_frame(stream: &mut TcpStream, frame: &camera::Frame<'_>) -> std::io::Result<()> {
-    let data = frame.data();
-    // Header: len(4) | "VOX1"(4) | format(1) | width(2) | height(2)
-    let mut hdr = [0u8; 13];
-    hdr[0..4].copy_from_slice(&((9 + data.len()) as u32).to_le_bytes());
-    hdr[4..8].copy_from_slice(b"VOX1");
-    hdr[8] = frame.format().map(|f| f.as_raw() as u8).unwrap_or(0);
-    hdr[9..11].copy_from_slice(&(frame.width() as u16).to_le_bytes());
-    hdr[11..13].copy_from_slice(&(frame.height() as u16).to_le_bytes());
+/// Read the laptop's start command (length-prefixed records, laptop -> MCU).
+/// Returns Ok(Some((duration_s, interval_ms))) on STRT, Ok(None) if the
+/// client disconnects before sending anything, Err on timeout / bad record.
+fn read_start_command(stream: &mut TcpStream) -> std::io::Result<Option<(u64, u64)>> {
+    let deadline = Instant::now() + Duration::from_secs(START_TIMEOUT_S);
+    stream.set_nonblocking(true)?;
+    loop {
+        let mut len_buf = [0u8; 4];
+        match read_exact_poll(stream, &mut len_buf, deadline) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let n = u32::from_le_bytes(len_buf) as usize;
+        if !(4..=12).contains(&n) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad command record length {n}"),
+            ));
+        }
+        let mut body = [0u8; 12];
+        read_exact_poll(stream, &mut body[..n], deadline)?;
+        if &body[..4] != MAGIC_START {
+            log::warn!("ignoring unknown command {:?}", &body[..4]);
+            continue; // keep waiting for a valid STRT
+        }
+        // Payload (optional): u32 duration_s, u32 interval_ms (see const docs).
+        let mut dur_s = DEFAULT_DURATION_S;
+        let mut interval_ms = DEFAULT_INTERVAL_MS;
+        if n >= 8 {
+            dur_s = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
+            if dur_s == 0 {
+                dur_s = DEFAULT_DURATION_S;
+            }
+        }
+        if n >= 12 {
+            interval_ms = u32::from_le_bytes(body[8..12].try_into().unwrap()) as u64;
+        }
+        return Ok(Some((dur_s, interval_ms)));
+    }
+}
 
-    stream.write_all(&hdr)?;
-    stream.write_all(data)
+/// Read exactly `buf.len()` bytes, tolerating WouldBlock (non-blocking socket)
+/// by polling with small delays until `deadline`. Err(UnexpectedEof) on a
+/// clean close, Err(TimedOut) past the deadline.
+fn read_exact_poll(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut got = 0;
+    while got < buf.len() {
+        use std::io::Read;
+        match stream.read(&mut buf[got..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client closed",
+                ))
+            }
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for the laptop command",
+                    ));
+                }
+                FreeRtos::delay_ms(20);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Capture one QXGA frame, 4x4-downsample it into the pipeline's level-0
+/// buffer (the upload payload), run the pyramid over it and assemble the VOX2
+/// record into `p.tx`. Err only on capture/format surprises (dims changed).
+fn map_frame(cam: &camera::Camera, p: &mut MapPipeline) -> Result<(), &'static str> {
+    let fb = cam.capture().ok_or("capture() returned no frame")?;
+    let (w, h) = (fb.width(), fb.height());
+    if (w, h) != (p.cam_w, p.cam_h) {
+        return Err("camera dims changed (pipeline sized for another frame)");
+    }
+    if fb.data().len() != w * h {
+        return Err("frame length != w*h (format not grayscale?)");
+    }
+    // Full sensor detail is captured at QXGA; the frame the pyramid (and the
+    // laptop) sees is the 4x4 INTER_AREA mean down to level-0 dims. The fb is
+    // read straight from the driver (no full-size copy) and returned right
+    // away so the driver can keep capturing while we process.
+    if !downscale::downscale_4x4(fb.data(), w, h, &mut p.frame) {
+        return Err("downscale_4x4 failed (buffer sizes?)");
+    }
+    drop(fb);
+
+    let n = pyramid::extract_pyramid(
+        &p.frame,
+        p.w,
+        p.h,
+        pyramid::FAST_THRESHOLD,
+        &mut p.arena,
+        &mut p.work,
+        &mut p.vcol,
+        &mut p.corners,
+        &mut p.scores,
+        &mut p.rowidx,
+        &mut p.nms,
+        &mut p.feats,
+    );
+    p.last_n = n;
+    // Only the first `n` entries are valid (p.feats keeps its full capacity).
+    build_record(&mut p.tx, p.w, p.h, &p.frame, &p.feats[..n]);
+    Ok(())
+}
+
+/// Assemble one VOX2 record into `buf`: length | magic | fmt | w | h | nfeat
+/// | raw pixels | per-feature {level, x, y, descriptor} (see receive_frames.py).
+fn build_record(buf: &mut Vec<u8>, w: usize, h: usize, frame: &[u8], feats: &[Feature]) {
+    let nfeat = feats.len();
+    // Payload after the u32 length: magic(4) + fmt(1) + w(2) + h(2) + nfeat(2)
+    // + w*h pixels + nfeat * (level 1 + x 4 + y 4 + desc 32).
+    let payload = 11 + w * h + nfeat * 41;
+
+    buf.clear();
+    buf.extend_from_slice(&(payload as u32).to_le_bytes());
+    buf.extend_from_slice(MAGIC);
+    buf.push(FMT_GRAYSCALE);
+    buf.extend_from_slice(&(w as u16).to_le_bytes());
+    buf.extend_from_slice(&(h as u16).to_le_bytes());
+    buf.extend_from_slice(&(nfeat as u16).to_le_bytes());
+    buf.extend_from_slice(frame);
+    for f in feats {
+        buf.push(f.level);
+        buf.extend_from_slice(&f.x.to_le_bytes());
+        buf.extend_from_slice(&f.y.to_le_bytes());
+        for word in f.desc {
+            buf.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+}
+
+/// Assemble the VOXD "done mapping" record into `buf`: length | magic |
+/// frames | total features (u32 LE each). Sent once at the end of every map
+/// run so the laptop can cross-check its own receive counts and start COLMAP.
+fn build_done_record(buf: &mut Vec<u8>, frames: u64, features: u64) {
+    // Payload after the u32 length: magic(4) + frames(4) + features(4).
+    let payload = 12;
+    buf.clear();
+    buf.extend_from_slice(&(payload as u32).to_le_bytes());
+    buf.extend_from_slice(MAGIC_DONE);
+    buf.extend_from_slice(&(frames as u32).to_le_bytes());
+    buf.extend_from_slice(&(features as u32).to_le_bytes());
+}
+
+fn send_record(stream: &mut TcpStream, record: &[u8]) -> std::io::Result<()> {
+    stream.write_all(record)
+}
+
+/// Frame-recycled buffers for the feature stream. Sizes are derived from the
+/// level-0 dims (the 4x4-downsampled camera frame); the QXGA fb itself is
+/// driver-owned and never copied. Allocate once (PSRAM), reuse every frame.
+struct MapPipeline {
+    /// Expected camera (sensor) frame dims — QXGA 2048x1536.
+    cam_w: usize,
+    cam_h: usize,
+    /// Processed level-0 dims after the 4x4 downsample (512x384 at QXGA).
+    w: usize,
+    h: usize,
+    /// 4x-downsampled frame == level 0 of the pyramid == the upload payload.
+    frame: Vec<u8>,
+    /// Downscaled-level storage (pyramid::extract_pyramid writes levels 1..6
+    /// here, forward, never re-reading a region once its level is processed).
+    arena: Vec<u8>,
+    /// Blur destination / downscale h-pass scratch.
+    work: Vec<u8>,
+    /// Box-blur running column sums (one u16 per column; hot, per output row).
+    vcol: Vec<u16>,
+    /// Per-level RAW FAST corner scratch (candidates before NMS).
+    corners: Vec<fast::Corner>,
+    /// Per-corner FAST scores (>= corners.len() i32s).
+    scores: Vec<i32>,
+    /// NMS row cursors: one usize per level-0 row.
+    rowidx: Vec<usize>,
+    /// NMS survivor store (features are described from here).
+    nms: Vec<fast::Corner>,
+    /// Feature store (first `n` of the last extraction are valid).
+    feats: Vec<Feature>,
+    /// Assembled VOX2 record for the last frame.
+    tx: Vec<u8>,
+    /// Features in the last extraction (p.feats[..last_n]).
+    last_n: usize,
+}
+
+impl MapPipeline {
+    /// Build the pipeline for camera dims `cam_w` x `cam_h` (level-0 dims are
+    /// those divided by 4 via downscale_4x4_size).
+    fn new(cam_w: usize, cam_h: usize) -> Self {
+        assert!(cam_w > 0 && cam_h > 0, "bad camera dims {cam_w}x{cam_h}");
+        let w = downscale::downscale_4x4_size(cam_w);
+        let h = downscale::downscale_4x4_size(cam_h);
+        assert!(w > 0 && h > 0, "camera dims too small to 4x4 downsample");
+        let nframe = w * h;
+        let nfeat = pyramid::MAX_FEATURES;
+        MapPipeline {
+            cam_w,
+            cam_h,
+            w,
+            h,
+            frame: vec![0u8; nframe],
+            arena: vec![0u8; pyramid::arena_bytes(w, h)],
+            work: vec![0u8; nframe],
+            vcol: vec![0u16; w],
+            corners: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
+            scores: vec![0i32; pyramid::CORNERS_RAW_MAX],
+            rowidx: vec![usize::MAX; h], // one per level-0 row (largest level)
+            nms: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
+            feats: vec![Feature::default(); nfeat],
+            // Record: length(4) + magic(4) + fmt(1) + w(2) + h(2) + nfeat(2)
+            // + frame + nfeat*41. Slightly over capacity is fine.
+            tx: Vec::with_capacity(15 + nframe + nfeat * 41),
+            last_n: 0,
+        }
+    }
 }
