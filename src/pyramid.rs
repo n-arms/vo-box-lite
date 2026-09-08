@@ -23,8 +23,10 @@
 //!  - `work`: box-blur destination AND downscale h-pass scratch — used at
 //!    different points of each level, never concurrently; >= `w * h` bytes.
 //!  - `vcol`: box-blur running column sums, >= `w` u16 (keep in internal SRAM).
-//!  - `corners`: per-level FAST scratch, >= [`CORNERS_PER_LEVEL`].
-//!  - `out`: feature store, >= [`MAX_FEATURES`].
+//! -  `corners`: per-level RAW FAST corner scratch, >= [`CORNERS_RAW_MAX`].
+//! -  `scores` >= corners.len() i32s, `rowidx` >= the level-0 height (usize
+//!    per image row), `nms`: non-max-suppression survivor store.
+//! -  `out`: feature store, >= [`MAX_FEATURES`].
 
 use crate::blur::box_blur5x5;
 use crate::downscale::downscale_65;
@@ -36,11 +38,19 @@ use crate::rbrief;
 pub const LEVELS: usize = 7;
 /// Fixed 6:5 pyramid ratio (the downscaler's scale per level).
 pub const SCALE: f32 = 1.2;
-/// FAST corner threshold — keep in sync with the future `localize` extractor
-/// (and slam-exp's process_images/localize.cpp, which use 40).
-pub const FAST_THRESHOLD: i32 = 40;
-/// Per-level FAST corner scratch cap (raw detector, no non-max suppression).
-pub const CORNERS_PER_LEVEL: usize = 2048;
+/// FAST corner threshold. Sep 8: 40 -> 20 (smooth webcam scenes gave 0
+/// corners), then 20 -> 10 once the capture moved to QXGA 2048x1536 4x4-down-
+/// sampled to 512x384 (the 4x4 mean blurs texture, so a weaker threshold is
+/// needed to keep corner density up). Keep the future `localize` extractor on
+/// the same value as THIS (map descriptors only match query descriptors
+/// extracted at the same threshold). slam-exp's C pipeline runs 40 on its own
+/// full-res captures — not directly comparable.
+pub const FAST_THRESHOLD: i32 = 10;
+/// Per-level RAW FAST corner scratch cap. Non-max suppression needs the FULL
+/// raw list to suppress exactly (a truncated list only suppresses its top
+/// rows), so this must comfortably exceed the raw count: 512x384 content at
+/// threshold 10 can yield a few thousand corners on textured scenes.
+pub const CORNERS_RAW_MAX: usize = 8192;
 /// Per-frame feature cap (= the `out` capacity the caller must provide).
 pub const MAX_FEATURES: usize = 4096;
 
@@ -93,10 +103,15 @@ pub fn arena_bytes(w: usize, h: usize) -> usize {
 
 /// Run the full pyramid extraction of the raw level-0 `img` (`w` x `h`) at
 /// FAST threshold `thr`. Returns the number of features written to `out`
-/// (levels in order 0..6, keypoints in scan order, only rBRIEF-valid ones).
+/// (levels in order 0..6, survivors of FAST non-max suppression in scan
+/// order, only rBRIEF-valid ones).
 ///
 /// Returns 0 if any buffer is undersized (checked once from the level-0 dims)
-/// or the image has no interior (w/h < 7).
+/// or the image has no interior (w/h < 7). Scratch: `corners` holds the raw
+/// FAST candidates for a level (>= [`CORNERS_RAW_MAX`] so full lists are
+/// scored and suppressed exactly), `scores` >= corners.len() i32s, `rowidx`
+/// >= `h` usize (one per image row of the largest level), `nms` is the
+/// survivor store (survivors past its length are dropped).
 pub fn extract_pyramid(
     img: &[u8],
     w: usize,
@@ -106,6 +121,9 @@ pub fn extract_pyramid(
     work: &mut [u8],
     vcol: &mut [u16],
     corners: &mut [fast::Corner],
+    scores: &mut [i32],
+    rowidx: &mut [usize],
+    nms: &mut [fast::Corner],
     out: &mut [Feature],
 ) -> usize {
     if img.len() < w * h
@@ -113,6 +131,9 @@ pub fn extract_pyramid(
         || work.len() < w * h
         || vcol.len() < w
         || corners.is_empty()
+        || scores.len() < corners.len()
+        || rowidx.len() < h
+        || nms.is_empty()
         || out.is_empty()
     {
         return 0;
@@ -128,7 +149,10 @@ pub fn extract_pyramid(
         if cw < 7 || ch < 7 || total >= out.len() {
             break;
         }
-        total += process_level(cur, cw, ch, thr, l as u8, scale, work, vcol, corners, out, total);
+        total += process_level(
+            cur, cw, ch, thr, l as u8, scale, work, vcol, corners, scores, rowidx, nms, out,
+            total,
+        );
         scale *= SCALE;
 
         if l + 1 == LEVELS {
@@ -154,7 +178,10 @@ pub fn extract_pyramid(
     total
 }
 
-/// FAST + 5x5 blur + rBRIEF on one level (`src`, `cw` x `ch`). Border-band
+/// FAST-12 (detect -> score -> non-max suppression, fast::fast12_detect_nonmax)
+/// + 5x5 blur + rBRIEF on one level (`src`, `cw` x `ch`). NMS runs on the raw
+/// level image before the blur (blur output = the rBRIEF image only; the raw
+/// level image stays untouched for the downscale that follows). Border-band
 /// keypoints are dropped (all-zero descriptor, never matched). Appends to
 /// `out[total..]` (up to `out.len()`); returns the number appended.
 #[allow(clippy::too_many_arguments)]
@@ -167,23 +194,27 @@ fn process_level(
     scale: f32,
     work: &mut [u8],
     vcol: &mut [u16],
-    corners: &mut [fast::Corner],
+    corners: &mut [fast::Corner], // raw candidates scratch
+    scores: &mut [i32],
+    rowidx: &mut [usize],
+    nms: &mut [fast::Corner], // NMS survivor store
     out: &mut [Feature],
     total: usize,
 ) -> usize {
-    let n = fast::fast12_detect(src, cw, ch, cw, thr, corners);
-    // Blur after FAST, before description (blur output = the rBRIEF image; the
-    // raw level image is untouched for the downscale that follows).
+    let n = fast::fast12_detect_nonmax(src, cw, ch, cw, thr, corners, scores, rowidx, nms);
+    // Blur after FAST, before description. Only reachable with n > 0 scratch
+    // (fast12_detect_nonmax returns 0 on undersized buffers, which would
+    // silently drop the level — the extract_pyramid preconditions prevent it).
     if !box_blur5x5(src, work, cw, ch, vcol) {
         return 0;
     }
     let mut added = 0;
-    let n = n.min(corners.len());
+    let n = n.min(nms.len());
     for i in 0..n {
         if total + added >= out.len() {
             break;
         }
-        let kp = corners[i];
+        let kp = nms[i];
         let mut desc = [0u32; 8];
         if rbrief::rbrief_descriptor(work, cw, ch, kp.x, kp.y, &mut desc) {
             out[total + added] = Feature {

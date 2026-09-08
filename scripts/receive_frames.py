@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Receive the vo-box-lite **map mode** stream and save each frame as a
-grayscale BMP + a feature CSV (slam-exp grey-features format, ready for the
-COLMAP map pipeline).
+"""Receive the vo-box-lite **map mode** stream: for each frame save a BMP of
+the original frame with every identified feature drawn as a red dot, plus the
+feature CSV (slam-exp grey-features format, ready for the COLMAP map pipeline).
 
 Wire format — one record per processed frame, as sent by src/bin/main.rs
 map_server()/build_record():
@@ -28,8 +28,10 @@ Usage:
     python3 receive_frames.py                 # save frames until Ctrl-C
     python3 receive_frames.py --host 192.168.71.1 --port 5000 --out frames
 
-Each saved frame produces <out>/frame_NNNNNN.bmp and <out>/frame_NNNNNN.csv
-(rows: x,y,<64 hex chars> — feature index = CSV row, like grey-features/).
+Each saved VOX2 frame produces <out>/frame_NNNNNN.bmp (original frame,
+8-bit gray), <out>/frame_NNNNNN_marked.bmp (24-bit; features drawn as red
+dots at their level-0 pixel positions) and <out>/frame_NNNNNN.csv (rows:
+x,y,<64 hex chars> — feature index = CSV row, like grey-features/).
 
 The ESP accepts ONE persistent TCP connection — kill any leftover `nc` first.
 """
@@ -43,6 +45,7 @@ from pathlib import Path
 MAGIC_VOX1 = b"VOX1"
 MAGIC_VOX2 = b"VOX2"
 FMT_GRAYSCALE = 3  # esp32-camera PIXFORMAT_GRAYSCALE
+DOT_RADIUS = 2     # feature marker radius in px
 
 
 def read_exact(conn: socket.socket, n: int) -> bytes:
@@ -57,7 +60,7 @@ def read_exact(conn: socket.socket, n: int) -> bytes:
 
 def parse_vox2(payload: bytes):
     """Parse a VOX2 payload (after magic): returns (fmt, w, h, pixels, feats)
-    where feats = list of (level, x, y, desc_bytes)."""
+    where feats = list of (level, x, y, desc_bytes). x/y are level-0 pixels."""
     fmt = payload[0]
     w, h, nfeat = struct.unpack("<HHH", payload[1:7])
     off = 7
@@ -86,22 +89,66 @@ def read_record(conn: socket.socket):
     raise ValueError(f"bad magic {magic!r} — stream out of sync")
 
 
+def _bmp_headers(w: int, h: int, pixel_bytes: int, bpp: int) -> bytes:
+    """Common 24/8-bit BMP file header + DIB header. bpp = 24 or 8."""
+    palette_off = 14 + 40 if bpp == 24 else 14 + 40 + 1024
+    file_size = palette_off + pixel_bytes
+    header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, palette_off)
+    info = struct.pack(
+        "<IiiHHIIiiII", 40, w, h, 1, bpp, 0, pixel_bytes, 2835, 2835,
+        256 if bpp == 8 else 0, 0,
+    )
+    return header + info
+
+
 def write_gray_bmp(path: Path, w: int, h: int, pixels: bytes) -> None:
-    """8-bit grayscale BMP: 14 B file hdr + 40 B info hdr + 256-entry palette
-    + bottom-up rows, each padded to a multiple of 4 bytes."""
+    """8-bit grayscale BMP (legacy VOX1 frames): 14 B file hdr + 40 B info hdr
+    + 256-entry palette + bottom-up rows, each padded to a multiple of 4 B."""
     row_pad = (4 - (w % 4)) % 4
     stride = w + row_pad
     rows = [pixels[y * w:(y + 1) * w] + b"\x00" * row_pad for y in reversed(range(h))]
     pixel_data = b"".join(rows)
-
-    palette_off = 14 + 40
-    file_size = palette_off + 1024 + len(pixel_data)
-    header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, palette_off)
-    info = struct.pack(
-        "<IiiHHIIiiII", 40, w, h, 1, 8, 0, len(pixel_data), 2835, 2835, 256, 0
-    )
     palette = b"".join(bytes((i, i, i, 0)) for i in range(256))
-    path.write_bytes(header + info + palette + pixel_data)
+    path.write_bytes(_bmp_headers(w, h, len(pixel_data), 8) + palette + pixel_data)
+
+
+def feature_dots(w: int, h: int, feats) -> set:
+    """Level-0 pixel positions of every feature, as a set of (x, y) ints.
+    Border keypoints are dropped on the S3, but clamp defensively anyway."""
+    dots = set()
+    for (_level, x, y, _desc) in feats:
+        cx, cy = int(round(x)), int(round(y))
+        if not (0 <= cx < w and 0 <= cy < h):
+            continue
+        for dy in range(-DOT_RADIUS, DOT_RADIUS + 1):
+            for dx in range(-DOT_RADIUS, DOT_RADIUS + 1):
+                if dx * dx + dy * dy <= DOT_RADIUS * DOT_RADIUS:
+                    px, py = cx + dx, cy + dy
+                    if 0 <= px < w and 0 <= py < h:
+                        dots.add((px, py))
+    return dots
+
+
+def write_marked_bmp(path: Path, w: int, h: int, gray: bytes, feats) -> None:
+    """24-bit BMP of the frame with each feature drawn as a red dot (BGR
+    (0,0,255)) at its level-0 pixel position. Bottom-up rows, 4-B padded."""
+    dots = feature_dots(w, h, feats)
+    row_pad = (4 - (w * 3) % 4) % 4
+    stride = w * 3 + row_pad
+    pixel_data = bytearray()
+    for y in reversed(range(h)):
+        row = bytearray(stride)
+        base = y * w
+        for x in range(w):
+            v = gray[base + x]
+            if (x, y) in dots:
+                row[x * 3:x * 3 + 3] = b"\x00\x00\xff"  # red
+            else:
+                row[x * 3] = v  # B
+                row[x * 3 + 1] = v  # G
+                row[x * 3 + 2] = v  # R
+        pixel_data += row
+    path.write_bytes(_bmp_headers(w, h, len(pixel_data), 24) + bytes(pixel_data))
 
 
 def write_feature_csv(path: Path, feats) -> None:
@@ -109,8 +156,7 @@ def write_feature_csv(path: Path, feats) -> None:
     feature index = row number). x/y are level-0 pixel coords from the S3."""
     lines = []
     for (_level, x, y, desc) in feats:
-        hexd = desc.hex()
-        lines.append(f"{x:.2f},{y:.2f},{hexd}")
+        lines.append(f"{x:.2f},{y:.2f},{desc.hex()}")
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -148,10 +194,14 @@ def main() -> int:
                     continue
                 count += 1
                 stem = out / f"frame_{count:06d}"
+                # Original frame (clean) + labeled frame (features as red dots)
+                # + feature CSV.
                 write_gray_bmp(Path(str(stem) + ".bmp"), w, h, pixels)
+                write_marked_bmp(Path(str(stem) + "_marked.bmp"), w, h, pixels, feats)
                 write_feature_csv(Path(str(stem) + ".csv"), feats)
                 print(
-                    f"saved {stem}.bmp ({w}x{h}) + .csv ({len(feats)} features)"
+                    f"saved {stem}.bmp + {stem}_marked.bmp ({w}x{h}, "
+                    f"{len(feats)} features as red dots) + .csv"
                 )
             if args.once:
                 return 0

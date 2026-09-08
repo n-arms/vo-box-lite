@@ -1,6 +1,11 @@
-//! Fixed 6:5 downsampler, byte-identical to slam-exp's `downscale_65_sse`:
-//! separable two-tap filter, weights ×128 with exact `>>7`, 6 px/rows -> 5.
-//! no_std, alloc-free, u16 math, no clamping; h-pass scratch = u8 (dw-strided).
+//! Fixed-ratio downsamplers for the pyramid:
+//! - [`downscale_65`]: 6:5, byte-identical to slam-exp's `downscale_65_sse`
+//!   (separable two-tap filter, weights ×128 with exact `>>7`, 6 px/rows -> 5;
+//!   h-pass scratch = u8, dw-strided).
+//! - [`downscale_4x4`]: INTER_AREA-style 4x4-block mean (fixed 4:1, `>>4`).
+//! Both no_std, alloc-free, u16 math, no clamping; trailing cols/rows beyond
+//! the last full block are never read. Caller-owned dst; dst must not alias
+//! src/scratch (in-place is unsupported).
 
 /// Weights for the first (earlier) sample of each output phase.
 const W1: [u16; 5] = [107, 85, 64, 43, 21];
@@ -80,6 +85,58 @@ pub fn downscale_65(
     // dw/dh == 0 (axis < 6): hpass/vpass have no groups and no-op.
     hpass(src, sw, sh, dw, tmp);
     vpass(tmp, dw, dh, dst);
+    true
+}
+
+/// Output size for one axis of the fixed 4:1 ratio (4x4 block -> 1 px): `n / 4`.
+#[inline]
+pub const fn downscale_4x4_size(n: usize) -> usize {
+    n / 4
+}
+
+/// INTER_AREA-style 4x4 downsample: `dst[y][x] = mean(src[4y..4y+4][4x..4x+4])`
+/// over non-overlapping blocks — the exact-integer-ratio form of OpenCV's
+/// `INTER_AREA` (dst dims = `sw/4`, `sh/4`; trailing partial rows/cols are
+/// never read, like the 6:5). Truncating mean via `>> 4`: the sum of 16 u8
+/// is ≤ 4080 (fits u16) and the exact shift reproduces a C `s / 16` division,
+/// matching the truncation convention of the rest of the pipeline. False on
+/// invalid sizes; axis < 4: valid empty output, nothing written. No scratch:
+/// each output pixel reads its own 4x4 block directly from src.
+pub fn downscale_4x4(src: &[u8], sw: usize, sh: usize, dst: &mut [u8]) -> bool {
+    let dw = downscale_4x4_size(sw);
+    let dh = downscale_4x4_size(sh);
+    if sw == 0 || sh == 0 || src.len() < sw * sh || dst.len() < dw * dh {
+        return false;
+    }
+    for y in 0..dh {
+        let y0 = 4 * y;
+        let r0 = &src[y0 * sw..(y0 + 1) * sw];
+        let r1 = &src[(y0 + 1) * sw..(y0 + 2) * sw];
+        let r2 = &src[(y0 + 2) * sw..(y0 + 3) * sw];
+        let r3 = &src[(y0 + 3) * sw..(y0 + 4) * sw];
+        let out = &mut dst[y * dw..(y + 1) * dw];
+        for x in 0..dw {
+            let i = 4 * x;
+            // 16 taps, k = 0..3 unrolled per row (compiler folds the offsets).
+            let s = r0[i] as u16
+                + r0[i + 1] as u16
+                + r0[i + 2] as u16
+                + r0[i + 3] as u16
+                + r1[i] as u16
+                + r1[i + 1] as u16
+                + r1[i + 2] as u16
+                + r1[i + 3] as u16
+                + r2[i] as u16
+                + r2[i + 1] as u16
+                + r2[i + 2] as u16
+                + r2[i + 3] as u16
+                + r3[i] as u16
+                + r3[i + 1] as u16
+                + r3[i + 2] as u16
+                + r3[i + 3] as u16;
+            out[x] = (s >> 4) as u8;
+        }
+    }
     true
 }
 
@@ -250,5 +307,101 @@ mod tests {
         let mut d2 = [0xFFu8; 5];
         assert!(downscale_65(&src, 5, 6, &mut tmp, &mut d2));
         assert_eq!(d2, [0xFF; 5]);
+    }
+
+    /// Independent reference: plain per-pixel index math (no row slices, no
+    /// unrolling), so the production loop structure is cross-checked.
+    fn naive_downscale_4x4(src: &[u8], sw: usize, sh: usize) -> Vec<u8> {
+        let dw = downscale_4x4_size(sw);
+        let dh = downscale_4x4_size(sh);
+        let mut out = vec![0u8; dw * dh];
+        for y in 0..dh {
+            for x in 0..dw {
+                let mut s = 0u32;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        s += src[(4 * y + dy) * sw + 4 * x + dx] as u32;
+                    }
+                }
+                out[y * dw + x] = (s >> 4) as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn area_sizes_follow_fixed_ratio() {
+        assert_eq!(downscale_4x4_size(640), 160); // VGA -> 160
+        assert_eq!(downscale_4x4_size(480), 120);
+        assert_eq!(downscale_4x4_size(4), 1);
+        assert_eq!(downscale_4x4_size(7), 1); // trailing col never read
+        assert_eq!(downscale_4x4_size(8), 2);
+        assert_eq!(downscale_4x4_size(0), 0);
+        assert_eq!(downscale_4x4_size(3), 0); // < 4: no block
+    }
+
+    #[test]
+    fn area_matches_naive_reference() {
+        // Trailing rows/cols (dims % 4) vary so the never-read tails are
+        // exercised, plus exact multiples and full-VGA size.
+        let sizes: &[(usize, usize)] = &[
+            (4, 4),
+            (4, 7),
+            (7, 4),
+            (9, 9),
+            (16, 12),
+            (17, 18),
+            (64, 48),
+            (640, 480), // VGA -> 160x120
+        ];
+        for &(sw, sh) in sizes {
+            let mut rng = Lcg(0x4D59_5DF4_D0F3_3173 ^ ((sw as u64) << 32) ^ (sh as u64));
+            for trial in 0..3 {
+                let mut src = vec![0u8; sw * sh];
+                rng.fill(&mut src);
+                let dw = downscale_4x4_size(sw);
+                let dh = downscale_4x4_size(sh);
+                let mut dst = vec![0xBBu8; dw * dh];
+                assert!(
+                    downscale_4x4(&src, sw, sh, &mut dst),
+                    "size {sw}x{sh}"
+                );
+                assert_eq!(
+                    dst,
+                    naive_downscale_4x4(&src, sw, sh),
+                    "size {sw}x{sh} trial {trial}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn area_mean_truncates_not_rounds() {
+        // 8x8 checkerboard (alternating 0/255): every 4x4 block holds 8 black
+        // + 8 white px, mean = 2040 >> 4 == 127 (truncating, not 128). Also
+        // exercises the u16 max path (16 * 255 = 4080).
+        let (sw, sh) = (8, 8);
+        let src: Vec<u8> = (0..sh)
+            .flat_map(|y| (0..sw).map(move |x| if (x + y) % 2 == 0 { 0 } else { 255 }))
+            .collect();
+        let dw = downscale_4x4_size(sw); // 2
+        let dh = downscale_4x4_size(sh);
+        let mut dst = vec![0u8; dw * dh];
+        assert!(downscale_4x4(&src, sw, sh, &mut dst));
+        assert!(dst.iter().all(|&p| p == 127), "got {dst:?}");
+    }
+
+    #[test]
+    fn area_rejects_bad_sizes_and_noops_on_small_axes() {
+        let src = [0u8; 64]; // 8x8
+        let mut dst = [0u8; 4]; // 2x2
+        assert!(!downscale_4x4(&src, 0, 8, &mut dst)); // zero dims
+        assert!(!downscale_4x4(&src, 8, 0, &mut dst));
+        assert!(!downscale_4x4(&src, 9, 8, &mut dst)); // src too small
+        assert!(!downscale_4x4(&src, 8, 8, &mut [0u8; 3])); // dst too small
+        // sw < 4: dw == 0 -> valid empty output, nothing written.
+        let mut d2 = [0xFFu8; 1];
+        assert!(downscale_4x4(&src, 3, 8, &mut d2));
+        assert_eq!(d2, [0xFF]);
     }
 }
