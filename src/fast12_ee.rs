@@ -20,8 +20,8 @@ static SIGN_BYTE: u8 = 0x80;
 struct Scratch([u8; 80]);
 
 /// Candidate vector of one 16-lane group as four u32s (word w = lanes
-/// 4w..4w+4, one byte per lane: 0xFF = heuristic candidate). All five window
-/// addresses must have 16 readable bytes in `im` (the caller's geometry does).
+/// 4w..4w+4, one byte per lane: 0xFF = heuristic candidate). The a_* args are
+/// byte indices into `im` with 16 readable bytes each (caller guarantees).
 fn group_words(
     im: &[u8],
     a_c: usize,
@@ -78,12 +78,12 @@ fn group_words_impl(
     out
 }
 
-/// EE kernel, one 16-lane group. Registers: q0 flip const, q1 cbx (then
-/// c_bx), q2 l0 (later p08), q3 cand, q4-q7 temps. The light pass saves each
-/// flipped pk window to `scr` (dark pass re-loads them: one PSRAM pass).
+/// EE kernel, one 16-lane group. The a_* args are byte indices into `im`,
+/// converted here to addresses (slice base + index) for the asm loads; the
+/// host mirror indexes `im` directly, so the shared seam passes indices.
 #[cfg(target_arch = "xtensa")]
 fn group_words_impl(
-    _im: &[u8],
+    im: &[u8],
     a_c: usize,
     a_p0: usize,
     a_p4: usize,
@@ -93,6 +93,7 @@ fn group_words_impl(
     scr: &mut Scratch,
 ) -> [u32; 4] {
     use core::arch::asm;
+    let base = im.as_ptr() as usize;
     let sgn_addr = &SIGN_BYTE as *const u8;
     let b_addr = &b as *const u8;
     let s = scr.0.as_mut_ptr(); // 16-aligned (repr(align(16)))
@@ -185,11 +186,11 @@ fn group_words_impl(
             "ee.movi.32.a q3, {o3}, 3",
             sgn = in(reg) sgn_addr,
             bt = in(reg) b_addr,
-            ac = in(reg) a_c,
-            p0 = in(reg) a_p0,
-            p4 = in(reg) a_p4,
-            p8 = in(reg) a_p8,
-            p12 = in(reg) a_p12,
+            ac = in(reg) (base + a_c),
+            p0 = in(reg) (base + a_p0),
+            p4 = in(reg) (base + a_p4),
+            p8 = in(reg) (base + a_p8),
+            p12 = in(reg) (base + a_p12),
             s0 = in(reg) s0,
             s1 = in(reg) s1,
             s2 = in(reg) s2,
