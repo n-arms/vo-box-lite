@@ -73,7 +73,7 @@ def receive_run(args, work: Path) -> None:
                       "task; update src/bin/main.rs")
                 continue
             # VOX2
-            fmt, w, h, pixels, feats = rf.parse_vox2(payload)
+            fmt, w, h, pixels, feats, timings = rf.parse_vox2(payload)
             if fmt != rf.FMT_GRAYSCALE or len(pixels) != w * h:
                 print(f"  !! bad VOX2 record (fmt {fmt}) — skipping")
                 continue
@@ -84,6 +84,11 @@ def receive_run(args, work: Path) -> None:
             rf.write_marked_bmp(marked / f"{stem}_marked.bmp", w, h, pixels, feats)
             print(f"[{time.strftime('%H:%M:%S')}] {stem}: {w}x{h}, {len(feats)} "
                   f"features ({idx} so far)")
+            if timings:
+                # Per-frame perf over WiFi (the ESP's console UART dies when a
+                # station joins, so the breakdown rides on the record).
+                print(f"    {rf.format_timings(timings)}")
+                print(f"    {rf.format_per_level(timings)}")
 
 
 def build_from_work(work: Path, args) -> int:
@@ -243,8 +248,9 @@ def main() -> int:
                          "frames + features (no ESP needed)")
     ap.add_argument("--min-features", type=int, default=MIN_FEATURES,
                     help="drop frames with fewer features than this")
-    ap.add_argument("--duration", type=int, default=30,
-                    help="map run length in seconds (sent in the STRT command)")
+    ap.add_argument("--duration", type=int, default=300,
+                    help="map run length in seconds (sent in the STRT command; "
+                         "default 300 = 5 min)")
     ap.add_argument("--interval", type=int, default=1000,
                     help="ms between streamed frames (0 = max rate; sent in STRT)")
     args = ap.parse_args()

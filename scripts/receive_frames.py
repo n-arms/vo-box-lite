@@ -17,6 +17,15 @@ MAGIC_STRT = b"STRT"  # laptop -> ESP: kick the map task off
 FMT_GRAYSCALE = 3  # esp32-camera PIXFORMAT_GRAYSCALE
 DOT_RADIUS = 2     # feature marker radius in px
 
+# VOX2 timing footer (firmware with WiFi perf data): appended after the last
+# feature descriptor — 3 stage u32s (capture / 4x4-downscale / build, µs)
+# then per pyramid level (7): 6 phase u32s (fast/score/nms/blur/rbrief/ds65,
+# µs) + a corners u16, all LE. Phase order must match build_record in
+# src/bin/main.rs. Old-firmware records have no footer (parse_vox2 tolerates).
+VOX2_FOOTER_BYTES = 3 * 4 + 7 * (6 * 4 + 2)
+VOX2_FOOTER_FMT = "<III" + "6IH" * 7
+VOX2_PHASES = ("fast", "score", "nms", "blur", "rbrief", "ds65")
+
 
 def read_exact(conn: socket.socket, n: int) -> bytes:
     buf = bytearray()
@@ -29,8 +38,10 @@ def read_exact(conn: socket.socket, n: int) -> bytes:
 
 
 def parse_vox2(payload: bytes):
-    """Parse a VOX2 payload (after magic): returns (fmt, w, h, pixels, feats)
-    where feats = list of (level, x, y, desc_bytes). x/y are level-0 pixels."""
+    """Parse a VOX2 payload (after magic): returns (fmt, w, h, pixels, feats,
+    timings) where feats = list of (level, x, y, desc_bytes) and timings = a
+    dict with the per-frame µs breakdown (None on old firmware without it).
+    x/y are level-0 pixels."""
     fmt = payload[0]
     w, h, nfeat = struct.unpack("<HHH", payload[1:7])
     off = 7
@@ -43,7 +54,46 @@ def parse_vox2(payload: bytes):
         desc = payload[off + 9:off + 41]
         off += 41
         feats.append((level, x, y, desc))
-    return fmt, w, h, pixels, feats
+    timings = None
+    if len(payload) - off >= VOX2_FOOTER_BYTES:
+        vals = struct.unpack_from(VOX2_FOOTER_FMT, payload, off)
+        timings = {
+            "capture_us": vals[0],
+            "ds4_us": vals[1],
+            "build_us": vals[2],
+            "levels": [],
+        }
+        for l in range(7):
+            base = 3 + l * 7
+            level = {ph: vals[base + k] for k, ph in enumerate(VOX2_PHASES)}
+            level["corners"] = vals[base + 6]
+            timings["levels"].append(level)
+    return fmt, w, h, pixels, feats, timings
+
+
+def format_timings(t: dict) -> str:
+    """One-line µs breakdown from a parsed VOX2 timing footer ('' if None).
+    Stage sums across all pyramid levels; mirrors the ESP's serial per-frame
+    log minus the send/pace stages (those are WiFi-side and not in-record)."""
+    if t is None:
+        return ""
+    sums = {ph: sum(l[ph] for l in t["levels"]) for ph in VOX2_PHASES}
+    pyr = sum(sums.values())
+    return (f"cap {t['capture_us']}us ds4 {t['ds4_us']}us pyr {pyr}us "
+            f"(fast {sums['fast']} score {sums['score']} nms {sums['nms']} "
+            f"blur {sums['blur']} rbrief {sums['rbrief']} ds65 {sums['ds65']}) "
+            f"build {t['build_us']}us")
+
+
+def format_per_level(t: dict) -> str:
+    """Per-pyramid-level phase total + NMS survivors ('' if None)."""
+    if t is None:
+        return ""
+    parts = []
+    for l, lvl in enumerate(t["levels"]):
+        tot = sum(lvl[ph] for ph in VOX2_PHASES)
+        parts.append(f"L{l} {tot}us/{lvl['corners']}feats")
+    return "per level: " + ", ".join(parts)
 
 
 def read_record(conn: socket.socket):
@@ -182,7 +232,7 @@ def main() -> int:
                 write_gray_bmp(out / f"frame_{count:06d}.bmp", w, h, pixels)
                 print(f"saved {out}/frame_{count:06d}.bmp ({w}x{h}) [legacy VOX1]")
             else:  # VOX2
-                fmt, w, h, pixels, feats = parse_vox2(payload)
+                fmt, w, h, pixels, feats, timings = parse_vox2(payload)
                 if fmt != FMT_GRAYSCALE or len(pixels) != w * h:
                     print(f"frame {count}: bad VOX2 (fmt {fmt}), skipping")
                     continue
@@ -197,6 +247,9 @@ def main() -> int:
                     f"saved {stem}.bmp + {stem}_marked.bmp ({w}x{h}, "
                     f"{len(feats)} features as red dots) + .csv"
                 )
+                if timings:
+                    print(f"  {format_timings(timings)}")
+                    print(f"  {format_per_level(timings)}")
             if args.once:
                 return 0
 

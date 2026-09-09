@@ -79,6 +79,51 @@ impl Default for Feature {
     }
 }
 
+/// Optional per-frame phase timings, filled by [`extract_pyramid`] when a
+/// profile is passed (`None` = no profiling: a branch per level, nothing
+/// else). One entry per pyramid level (index 0 = full size); `downscale_us[l]`
+/// covers the 6:5 downscale INTO level l+1 (so index LEVELS-1 is never
+/// written), `corners[l]` is the level's NMS survivor count (the rBRIEF
+/// keypoint workload).
+///
+/// The clock is caller-injected (`now_us`, a monotonic microsecond fn —
+/// `std::time::Instant` based on the S3) so this no_std lib stays portable;
+/// host builds can pass a fake clock.
+#[derive(Debug)]
+pub struct PyramidProfile {
+    /// Caller's microsecond clock (see the struct docs).
+    pub now_us: fn() -> u64,
+    /// FAST-12 detect per level.
+    pub fast_us: [u64; LEVELS],
+    /// FAST corner score per level (binary-search strength, feeds NMS).
+    pub score_us: [u64; LEVELS],
+    /// Non-max suppression per level.
+    pub nms_us: [u64; LEVELS],
+    /// 5x5 box blur per level.
+    pub blur_us: [u64; LEVELS],
+    /// rBRIEF description per level (over the NMS survivors).
+    pub rbrief_us: [u64; LEVELS],
+    /// 6:5 downscale into the next level (index LEVELS-1 unused).
+    pub downscale_us: [u64; LEVELS],
+    /// NMS survivors per level.
+    pub corners: [usize; LEVELS],
+}
+
+impl PyramidProfile {
+    pub fn new(now_us: fn() -> u64) -> Self {
+        PyramidProfile {
+            now_us,
+            fast_us: [0; LEVELS],
+            score_us: [0; LEVELS],
+            nms_us: [0; LEVELS],
+            blur_us: [0; LEVELS],
+            rbrief_us: [0; LEVELS],
+            downscale_us: [0; LEVELS],
+            corners: [0; LEVELS],
+        }
+    }
+}
+
 /// Level-`l` pixel dims from level-0 `(w, h)` (6:5 rule applied `l` times).
 pub fn level_dims(w: usize, h: usize, l: usize) -> (usize, usize) {
     let mut cw = w;
@@ -112,6 +157,9 @@ pub fn arena_bytes(w: usize, h: usize) -> usize {
 /// scored and suppressed exactly), `scores` >= corners.len() i32s, `rowidx`
 /// >= `h` usize (one per image row of the largest level), `nms` is the
 /// survivor store (survivors past its length are dropped).
+///
+/// `profile`: optional per-phase/per-level timers, filled for the levels that
+/// actually ran (skipped levels stay 0). Pass None to skip profiling.
 pub fn extract_pyramid(
     img: &[u8],
     w: usize,
@@ -125,6 +173,7 @@ pub fn extract_pyramid(
     rowidx: &mut [usize],
     nms: &mut [fast::Corner],
     out: &mut [Feature],
+    mut profile: Option<&mut PyramidProfile>,
 ) -> usize {
     if img.len() < w * h
         || arena.len() < arena_bytes(w, h)
@@ -152,6 +201,7 @@ pub fn extract_pyramid(
         total += process_level(
             cur, cw, ch, thr, l as u8, scale, work, vcol, corners, scores, rowidx, nms, out,
             total,
+            profile.as_deref_mut(),
         );
         scale *= SCALE;
 
@@ -167,8 +217,14 @@ pub fn extract_pyramid(
         // are disjoint and written forward, so `cur` never aliases it). `work`
         // is reused as the h-pass scratch — the level's blur output is dead.
         let (region, tail) = rest.split_at_mut(dw * dh);
+        // The 6:5 downscale runs between levels, so it is timed here (not in
+        // process_level) when a profile is attached.
+        let ds_t0 = profile.as_ref().map(|pr| (pr.now_us)());
         if !downscale_65(cur, cw, ch, work, region) {
             return total;
+        }
+        if let (Some(pr), Some(ds_t0)) = (profile.as_deref_mut(), ds_t0) {
+            pr.downscale_us[l] = (pr.now_us)() - ds_t0;
         }
         cur = &*region;
         rest = tail;
@@ -178,12 +234,14 @@ pub fn extract_pyramid(
     total
 }
 
-/// FAST-12 (detect -> score -> non-max suppression, fast::fast12_detect_nonmax)
-/// + 5x5 blur + rBRIEF on one level (`src`, `cw` x `ch`). NMS runs on the raw
-/// level image before the blur (blur output = the rBRIEF image only; the raw
-/// level image stays untouched for the downscale that follows). Border-band
-/// keypoints are dropped (all-zero descriptor, never matched). Appends to
-/// `out[total..]` (up to `out.len()`); returns the number appended.
+/// FAST-12 (detect -> score -> non-max suppression) + 5x5 blur + rBRIEF on
+/// one level (`src`, `cw` x `ch`). NMS runs on the raw level image before the
+/// blur (blur output = the rBRIEF image only; the raw level image stays
+/// untouched for the downscale that follows). Border-band keypoints are
+/// dropped (all-zero descriptor, never matched). Appends to `out[total..]`
+/// (up to `out.len()`); returns the number appended. When `profile` is Some,
+/// the per-phase timers for this level are filled (fast/score/nms/blur/
+/// rbrief; the inter-level downscale is timed by extract_pyramid).
 #[allow(clippy::too_many_arguments)]
 fn process_level(
     src: &[u8],
@@ -200,13 +258,46 @@ fn process_level(
     nms: &mut [fast::Corner], // NMS survivor store
     out: &mut [Feature],
     total: usize,
+    mut profile: Option<&mut PyramidProfile>,
 ) -> usize {
-    let n = fast::fast12_detect_nonmax(src, cw, ch, cw, thr, corners, scores, rowidx, nms);
-    // Blur after FAST, before description. Only reachable with n > 0 scratch
-    // (fast12_detect_nonmax returns 0 on undersized buffers, which would
-    // silently drop the level — the extract_pyramid preconditions prevent it).
+    let li = level as usize;
+    // Detect -> score -> non-max suppression, timed per phase when a profile
+    // is attached. The three calls are exactly what fast::fast12_detect_nonmax
+    // does (fast.rs's `detect_nonmax_wrapper_matches_manual` test guards the
+    // equivalence); they are split here only so each phase can be timed — keep
+    // in sync with that wrapper. The pyramid preconditions keep the scratch
+    // sized, so no level is ever truncated/starved by this composition.
+    let mut t0 = 0u64; // phase start on the profile clock (0 = not profiling)
+    if let Some(pr) = profile.as_deref_mut() {
+        t0 = (pr.now_us)();
+    }
+    let nraw = fast::fast12_detect(src, cw, ch, cw, thr, corners);
+    if let Some(pr) = profile.as_deref_mut() {
+        pr.fast_us[li] = (pr.now_us)() - t0;
+        t0 = (pr.now_us)();
+    }
+    let mut n = 0usize; // NMS survivors (== fast12_detect_nonmax's result)
+    if nraw > 0 {
+        let nsc = fast::fast12_score(src, cw, &corners[..nraw.min(corners.len())], thr, scores);
+        if let Some(pr) = profile.as_deref_mut() {
+            pr.score_us[li] = (pr.now_us)() - t0;
+            t0 = (pr.now_us)();
+        }
+        n = fast::nonmax_suppression(&corners[..nsc], &scores[..nsc], rowidx, nms);
+        if let Some(pr) = profile.as_deref_mut() {
+            pr.nms_us[li] = (pr.now_us)() - t0;
+        }
+    }
+    // Blur after FAST, before description.
+    if let Some(pr) = profile.as_deref_mut() {
+        t0 = (pr.now_us)();
+    }
     if !box_blur5x5(src, work, cw, ch, vcol) {
         return 0;
+    }
+    if let Some(pr) = profile.as_deref_mut() {
+        pr.blur_us[li] = (pr.now_us)() - t0;
+        t0 = (pr.now_us)();
     }
     let mut added = 0;
     let n = n.min(nms.len());
@@ -225,6 +316,10 @@ fn process_level(
             };
             added += 1;
         }
+    }
+    if let Some(pr) = profile.as_deref_mut() {
+        pr.rbrief_us[li] = (pr.now_us)() - t0;
+        pr.corners[li] = n; // rBRIEF attempts == NMS survivors this level
     }
     added
 }
