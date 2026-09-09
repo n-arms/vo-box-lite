@@ -3,7 +3,7 @@ target = "xtensa-esp32s3-espidf"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+runner = "bash scripts/cargo_run.sh"   # flash via usbipd-attached WSL serial, then console on the Windows COM port (see scripts/cargo_run.sh)
 rustflags = [ "--cfg",  "espidf_time64"]
 
 [unstable]
