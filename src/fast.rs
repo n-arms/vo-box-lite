@@ -14,6 +14,13 @@ mod trees {
     include!("fast12_trees.rs");
 }
 
+/// SIMD FAST-12 for the ESP32-S3 (EE heuristic + scalar pattern-tree confirm):
+/// same corner set as the scalar fns above; host builds use a scalar mirror
+/// of the SIMD lane semantics so the whole scan geometry is testable.
+pub mod ee {
+    include!("fast12_ee.rs");
+}
+
 /// Per-image circle offsets: off[k] = dx + dy*stride from the CIRCLE table.
 fn circle_offsets(stride: usize) -> [isize; 16] {
     let mut o = [0isize; 16];
@@ -563,5 +570,90 @@ mod tests {
                 assert_eq!(&out[..nn], naive.as_slice(), "{label}: vs naive corners");
             }
         }
+    }
+
+    // ---- SIMD EE variant (fast.rs::ee) vs the scalar path ----
+
+    /// ee (raw detect and full score+NMS) must be bit-identical to the scalar
+    /// path for every image/stride/threshold (host = scalar mirror of the
+    /// SIMD lane semantics; xtensa = the inline-asm kernel).
+    fn ee_matches_scalar_case(im: &[u8], w: usize, h: usize, stride: usize, b: i32, label: &str) {
+        const CAP: usize = 8192;
+        // Raw detect, both paths, same store cap -> identical lists AND totals.
+        let mut a = vec![Corner { x: 0, y: 0 }; CAP];
+        let mut b2 = vec![Corner { x: 0, y: 0 }; CAP];
+        let na = fast12_detect(im, w, h, stride, b, &mut a);
+        let nb = ee::fast12_detect_ee(im, w, h, stride, b, &mut b2);
+        assert_eq!(na, nb, "{label}: ee raw count");
+        assert_eq!(&a[..na.min(CAP)], &b2[..nb.min(CAP)], "{label}: ee raw corners");
+        // Full pipeline: detect -> score -> NMS on both paths.
+        let mut ca = vec![Corner { x: 0, y: 0 }; CAP];
+        let mut sa = vec![0i32; CAP];
+        let mut ra = vec![usize::MAX; h.max(1)];
+        let mut oa = vec![Corner { x: 0, y: 0 }; CAP];
+        let nna = fast12_detect_nonmax(im, w, h, stride, b, &mut ca, &mut sa, &mut ra, &mut oa);
+        let mut cb = vec![Corner { x: 0, y: 0 }; CAP];
+        let mut sb = vec![0i32; CAP];
+        let mut rb = vec![usize::MAX; h.max(1)];
+        let mut ob = vec![Corner { x: 0, y: 0 }; CAP];
+        let nnb = ee::fast12_detect_nonmax_ee(
+            im, w, h, stride, b, &mut cb, &mut sb, &mut rb, &mut ob,
+        );
+        assert_eq!(nna, nnb, "{label}: ee nonmax count");
+        assert_eq!(&oa[..nna], &ob[..nnb], "{label}: ee nonmax corners");
+    }
+
+    #[test]
+    fn ee_matches_scalar() {
+        // Strides >= 16 take the SIMD path; odd/padded widths exercise the
+        // right-edge strip; tiny strides take the scalar fallback.
+        for (w, h, stride) in [
+            (64usize, 48usize, 64usize),
+            (97, 63, 97),       // odd width: tail strip + misaligned rows
+            (100, 76, 100),     // width%16 = 4
+            (60, 44, 128),      // padded stride, width < stride
+            (127, 95, 127),     // dense 4x4 dots: many candidates + NMS
+            (96, 72, 96),
+            (33, 17, 33),
+            (7, 7, 7),          // scalar fallback (stride < 16), single px
+            (15, 15, 16),       // w < 16 but stride >= 16: strip-only SIMD
+            (23, 11, 32),       // padded, h barely above the 3-radius borders
+        ] {
+            let dots = w == 127 && h == 95;
+            let im = if dots {
+                let mut v = vec![0u8; w * h];
+                for (i, p) in v.iter_mut().enumerate() {
+                    *p = if (i % w % 8) < 4 && (i / w % 8) < 4 { 200 } else { 40 };
+                }
+                v
+            } else {
+                let seed = 0x0F1E_2D3C_4B5A_6978 ^ ((w as u64) << 32)
+                    ^ ((h as u64) << 16) ^ (stride as u64);
+                rand_img(w, h, stride, seed)
+            };
+            for b in [8i32, 20, 40] {
+                ee_matches_scalar_case(&im, w, h, stride, b, &format!("{w}x{h} s{stride} b{b}"));
+            }
+        }
+    }
+
+    #[test]
+    fn ee_falls_back_out_of_domain() {
+        // b outside [1,127] and stride < 16 must delegate to the scalar
+        // detector (identical sets), never panic or read out of bounds.
+        let im = rand_img(96, 72, 96, 0x5151_5A5A);
+        let mut a = vec![Corner { x: 0, y: 0 }; 8192];
+        let mut b = vec![Corner { x: 0, y: 0 }; 8192];
+        for (bb, lab) in [(0i32, "b=0"), (128, "b=128"), (200, "b=200"), (-5, "b<0")] {
+            let na = fast12_detect(&im, 96, 72, 96, bb, &mut a);
+            let nb = ee::fast12_detect_ee(&im, 96, 72, 96, bb, &mut b);
+            assert_eq!(na, nb, "{lab}: count");
+            assert_eq!(&a[..na], &b[..nb], "{lab}: corners");
+        }
+        let small = rand_img(8, 8, 8, 0x0B0B);
+        let na = fast12_detect(&small, 8, 8, 8, 20, &mut a);
+        let nb = ee::fast12_detect_ee(&small, 8, 8, 8, 20, &mut b);
+        assert_eq!(na, nb, "tiny: count");
+        assert_eq!(&a[..na], &b[..nb], "tiny: corners");
     }
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""gen_fast12_scalar.py -- train a naive 16-pixel FAST-12 ID3 tree (no
-cardinal/SIMD priors) on exhaustive 2^16 configs and emit the Rust trees
-module for src/fast.rs. Usage: gen_fast12_scalar.py [-o fast12_trees.rs]"""
+"""gen_fast12_scalar.py -- FAST-12 ID3 decision-tree generator (Rust output).
+`-o` naive 16-pixel trees; `--confirm-out` the 8 pattern trees for the SIMD
+3-of-4-cardinal confirm (fast.rs::ee). Usage: gen_fast12_scalar.py [-o fast12_trees.rs] [--confirm-out fast12_cardinal_trees.rs]
+"""
 
 import math
 import sys
@@ -73,6 +74,34 @@ def id3(configs):
     return ("node", best, id3(c0), id3(c1))
 
 
+def id3_labeled(configs):
+    """ID3 over explicit (mask, label) configs (pattern trees: only the free
+    pixels are features). Same structure as id3() above."""
+    cnt = [0, 0]
+    for _, l in configs:
+        cnt[l] += 1
+    if cnt[0] == 0:
+        return ("leaf", 1)
+    if cnt[1] == 0:
+        return ("leaf", 0)
+    h = entropy(cnt[0], cnt[1])
+    best, gain = -1, 0.0
+    for f in range(N):
+        t = [[0, 0], [0, 0]]
+        for m, l in configs:
+            t[(m >> f) & 1][l] += 1
+        s0 = t[0][0] + t[0][1]
+        s1 = len(configs) - s0
+        if s0 and s1:
+            g = h - (s0 * entropy(t[0][0], t[0][1]) + s1 * entropy(t[1][0], t[1][1])) / len(configs)
+            if g > gain:  # ascending f, strict >: ties keep the lowest index
+                best, gain = f, g
+    assert best != -1, "impure node with no informative feature"
+    c0 = [(m, l) for m, l in configs if ((m >> best) & 1) == 0]
+    c1 = [(m, l) for m, l in configs if (m >> best) & 1]
+    return ("node", best, id3_labeled(c0), id3_labeled(c1))
+
+
 def eval_tree(node, mask):
     while node[0] != "leaf":
         node = node[3] if (mask >> node[1]) & 1 else node[2]
@@ -117,32 +146,224 @@ def write_rust_module(tree, out):
     out.write("}\n")
 
 
+# ----------------------------------------------------------------
+# Pattern trees for the SIMD 3-of-4-cardinal heuristic confirm
+# ----------------------------------------------------------------
+
+# Cardinal circle positions (fast.c's make_offsets() order): pixel 0 = (0,+3),
+# 4 = (3,0), 8 = (0,-3), 12 = (-3,0).
+CARDINALS = (0, 4, 8, 12)
+
+
+def heuristic_fires(mask):
+    """3-of-4 heuristic on a polarity mask: >= 3 of the 4 cardinals on (the
+    corner rule is polarity-agnostic: 12 contiguous bits set, one polarity)."""
+    return sum(1 for k in CARDINALS if (mask >> k) & 1) >= 3
+
+
+def pattern_configs(known_on):
+    """All 2^13 masks with the 3 cardinals of a pattern fixed to `known_on`
+    (circle indices), the other 13 pixels free. Returns (masks, free)."""
+    fixed = 0
+    for k in known_on:
+        fixed |= 1 << k
+    free = [k for k in range(N) if k not in known_on]
+    masks = []
+    for subset in range(1 << len(free)):
+        m = fixed
+        for i, k in enumerate(free):
+            if (subset >> i) & 1:
+                m |= 1 << k
+        masks.append(m)
+    return masks, free
+
+
+def train_pattern_tree(known_on):
+    """ID3 over the 13 free pixels of one pattern, configs labeled by the exact
+    12-contiguous rule. The polarity only mirrors the comparison ('>' vs '<'),
+    so one tree body serves both. Returns (tree, free_pixels)."""
+    masks, free = pattern_configs(known_on)
+    configs = [(m, 1 if is_corner(m) else 0) for m in masks]
+    return id3_labeled(configs), free
+
+
+def eval_tree_mask_rot(node, mask, r):
+    """Evaluate a base pattern tree with its free-pixel tests mapped by the
+    circle rotation r onto a mask of the rot-r pattern class."""
+    while node[0] != "leaf":
+        node = node[3] if (mask >> ((node[1] + r) % N)) & 1 else node[2]
+    return node[1]
+
+
+def emit_confirm_tree(node, pad, free2orig, op, out):
+    """Nested-if Rust for one pattern tree, like emit_rust but with the
+    rotation's pixel indices and the polarity's comparison op against `thr`."""
+    if node[0] == "leaf":
+        out.write(f"{pad}return {'true' if node[1] else 'false'};\n")
+        return
+    _, f, c0, c1 = node
+    k = free2orig[f]
+    out.write(f"{pad}if (p[(c + off[{k}]) as usize] as i32) {op} thr {{\n")
+    emit_confirm_tree(c1, pad + "    ", free2orig, op, out)
+    out.write(f"{pad}}} else {{\n")
+    emit_confirm_tree(c0, pad + "    ", free2orig, op, out)
+    out.write(f"{pad}}}\n")
+
+
+PATTERN_LABELS = {0: "LLLx/LLLL (0,4,8 on)", 4: "xLLL (4,8,12 on)",
+                  8: "LxLL (8,12,0 on)", 12: "LLxL (12,0,4 on)"}
+
+
+def selfcheck_pattern_trees(light_tree, dark_tree):
+    """Every rotation x every 2^13 config of its pattern class must reproduce
+    the exact rule; and the 3-of-4 heuristic must be lossless over all 2^16
+    masks (no true corner of either polarity is dropped)."""
+    for r in (0, 4, 8, 12):
+        known = [(k + r) % N for k in (0, 4, 8)]
+        masks, _ = pattern_configs(known)
+        for m in masks:
+            got = eval_tree_mask_rot(light_tree, m, r)
+            assert got == is_corner(m), f"light self-check failed rot {r} mask {m:#06x}"
+            got = eval_tree_mask_rot(dark_tree, m, r)
+            assert got == is_corner(m), f"dark self-check failed rot {r} mask {m:#06x}"
+    for m in range(1 << N):
+        assert (not is_corner(m)) or heuristic_fires(m), \
+            f"heuristic dropped corner mask {m:#06x}"
+    print("pattern self-check: 8 rotations x 8192 configs exact; "
+          "heuristic lossless over all 2^16 masks", file=sys.stderr)
+
+
+def write_confirm_module(light_tree, dark_tree, out_path):
+    out = open(out_path, "w")
+    out.write("/* fast12_cardinal_trees.rs -- GENERATED by gen_fast12_scalar.py "
+              "--confirm-out,\n")
+    out.write(" * do not edit. Regenerate: python3 scripts/gen_fast12_scalar.py "
+              "--confirm-out src/fast12_cardinal_trees.rs\n")
+    out.write(" * 8 pattern-specialized ID3 trees for the SIMD 3-of-4-cardinal\n")
+    out.write(" * confirm (fast.rs::ee): one tree per state (LLLx/LLxL/LxLL/xLLL\n")
+    out.write(" * + dark mirrors, 4th cardinal free so LLLL/DDDD ride along),\n")
+    out.write(" * trained on exhaustive 2^13 configs of the 13 free pixels. */\n\n")
+    for r in (0, 4, 8, 12):
+        out.write(f"/// Light pattern {PATTERN_LABELS[r]} "
+                  f"(12-contiguous strictly > thr).\n")
+        out.write(f"#[inline(always)]\nfn light_rot{r}(p: &[u8], c: isize, "
+                  f"off: &[isize; 16], thr: i32) -> bool {{\n")
+        emit_confirm_tree(light_tree, "    ", {f: (f + r) % N for f in range(N)}, ">", out)
+        out.write("}\n\n")
+    for r in (0, 4, 8, 12):
+        out.write(f"/// Dark pattern {PATTERN_LABELS[r]} "
+                  f"(12-contiguous strictly < thr).\n")
+        out.write(f"#[inline(always)]\nfn dark_rot{r}(p: &[u8], c: isize, "
+                  f"off: &[isize; 16], thr: i32) -> bool {{\n")
+        emit_confirm_tree(dark_tree, "    ", {f: (f + r) % N for f in range(N)}, "<", out)
+        out.write("}\n\n")
+    out.write("""/// Exact FAST-12 test for one heuristic candidate: dispatch on the
+/// pixel's cardinal pattern (a SIMD candidate always matches one) and run
+/// that state's tree. cb = center + b, c_b = center - b.
+#[inline(always)]
+pub fn confirm(p: &[u8], c: isize, off: &[isize; 16], cb: i32, c_b: i32) -> bool {
+    if (p[(c + off[0]) as usize] as i32) > cb
+        && (p[(c + off[4]) as usize] as i32) > cb
+        && (p[(c + off[8]) as usize] as i32) > cb
+    {
+        return light_rot0(p, c, off, cb);
+    }
+    if (p[(c + off[4]) as usize] as i32) > cb
+        && (p[(c + off[8]) as usize] as i32) > cb
+        && (p[(c + off[12]) as usize] as i32) > cb
+    {
+        return light_rot4(p, c, off, cb);
+    }
+    if (p[(c + off[8]) as usize] as i32) > cb
+        && (p[(c + off[12]) as usize] as i32) > cb
+        && (p[(c + off[0]) as usize] as i32) > cb
+    {
+        return light_rot8(p, c, off, cb);
+    }
+    if (p[(c + off[12]) as usize] as i32) > cb
+        && (p[(c + off[0]) as usize] as i32) > cb
+        && (p[(c + off[4]) as usize] as i32) > cb
+    {
+        return light_rot12(p, c, off, cb);
+    }
+    if (p[(c + off[0]) as usize] as i32) < c_b
+        && (p[(c + off[4]) as usize] as i32) < c_b
+        && (p[(c + off[8]) as usize] as i32) < c_b
+    {
+        return dark_rot0(p, c, off, c_b);
+    }
+    if (p[(c + off[4]) as usize] as i32) < c_b
+        && (p[(c + off[8]) as usize] as i32) < c_b
+        && (p[(c + off[12]) as usize] as i32) < c_b
+    {
+        return dark_rot4(p, c, off, c_b);
+    }
+    if (p[(c + off[8]) as usize] as i32) < c_b
+        && (p[(c + off[12]) as usize] as i32) < c_b
+        && (p[(c + off[0]) as usize] as i32) < c_b
+    {
+        return dark_rot8(p, c, off, c_b);
+    }
+    if (p[(c + off[12]) as usize] as i32) < c_b
+        && (p[(c + off[0]) as usize] as i32) < c_b
+        && (p[(c + off[4]) as usize] as i32) < c_b
+    {
+        return dark_rot12(p, c, off, c_b);
+    }
+    false
+}
+""")
+    out.close()
+    ln = sum(1 for _ in open(out_path))
+    print(f"emitted {out_path} ({ln} lines: 8 pattern trees + dispatch)", file=sys.stderr)
+
+
 def main():
     args = sys.argv[1:]
     if args in (["-h"], ["--help"]):
         print(__doc__)
         return
     out_path = args[1] if len(args) == 2 and args[0] == "-o" else None
-    if out_path is None and args:
-        print("usage: python3 scripts/gen_fast12_scalar.py [-o src/fast12_trees.rs]",
-              file=sys.stderr)
+    confirm_out = None
+    if "--confirm-out" in args:
+        i = args.index("--confirm-out")
+        if i + 1 >= len(args):
+            print("--confirm-out needs a path", file=sys.stderr)
+            sys.exit(2)
+        confirm_out = args[i + 1]
+        if out_path is None:  # allow --confirm-out alone (no naive module)
+            rest = [a for j, a in enumerate(args) if j != i and j != i + 1]
+            out_path = rest[1] if len(rest) == 2 and rest[0] == "-o" else None
+    if out_path is None and confirm_out is None:
+        print("usage: python3 scripts/gen_fast12_scalar.py [-o src/fast12_trees.rs] "
+              "[--confirm-out src/fast12_cardinal_trees.rs]", file=sys.stderr)
         sys.exit(2)
 
-    t0 = time.time()
-    tree = id3(list(range(1 << N)))
-    t_train = time.time() - t0
-    for m in range(1 << N):
-        assert eval_tree(tree, m) == LABELS[m], f"self-check failed on mask {m:#06x}"
-    nodes, depth = stats(tree)
-    print(f"tree {nodes} nodes, depth {depth}, {sum(LABELS)}/{1 << N} masks are corners; "
-          f"trained in {t_train:.1f}s; self-check passed (both polarities, all masks)",
-          file=sys.stderr)
-
-    out = open(out_path, "w") if out_path else sys.stdout
-    write_rust_module(tree, out)
-    if out_path:
+    if out_path is not None:
+        t0 = time.time()
+        tree = id3(list(range(1 << N)))
+        t_train = time.time() - t0
+        for m in range(1 << N):
+            assert eval_tree(tree, m) == LABELS[m], f"self-check failed on mask {m:#06x}"
+        nodes, depth = stats(tree)
+        print(f"tree {nodes} nodes, depth {depth}, {sum(LABELS)}/{1 << N} masks are "
+              f"corners; trained in {t_train:.1f}s; self-check passed (both "
+              f"polarities, all masks)", file=sys.stderr)
+        out = open(out_path, "w")
+        write_rust_module(tree, out)
         out.close()
         print(f"emitted {out_path} ({nodes} tree nodes)", file=sys.stderr)
+
+    if confirm_out is not None:
+        t0 = time.time()
+        light_tree, _ = train_pattern_tree((0, 4, 8))
+        dark_tree, _ = train_pattern_tree((0, 4, 8))
+        t_train = time.time() - t0
+        ln, dp = stats(light_tree)
+        print(f"pattern base tree {ln} nodes, depth {dp}; trained in {t_train:.1f}s",
+              file=sys.stderr)
+        selfcheck_pattern_trees(light_tree, dark_tree)
+        write_confirm_module(light_tree, dark_tree, confirm_out)
 
 
 if __name__ == "__main__":
