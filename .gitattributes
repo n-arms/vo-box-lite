@@ -1,0 +1,3 @@
+# Keep text files LF on checkout (the global core.autocrlf=true would rewrite
+# scripts/ as CRLF, which breaks bash). Matches the parent slam-exp repo.
+* text=auto eol=lf

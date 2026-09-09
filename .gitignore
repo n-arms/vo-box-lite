@@ -27,3 +27,8 @@
 
 # Python bytecode cache
 **/__pycache__/
+
+# Run artifacts (receive_map.py/serial monitor output, live-capture logs)
+/map_run/
+/out.log
+/crashlog

@@ -267,11 +267,14 @@ fn process_level(
     // equivalence); they are split here only so each phase can be timed — keep
     // in sync with that wrapper. The pyramid preconditions keep the scratch
     // sized, so no level is ever truncated/starved by this composition.
+    // FAST detect runs the SIMD EE variant (fast::ee) -- same corner set as
+    // scalar (host-verified), level dims/thr inside its domain; score/NMS
+    // stay scalar so the per-phase profile is unchanged.
     let mut t0 = 0u64; // phase start on the profile clock (0 = not profiling)
     if let Some(pr) = profile.as_deref_mut() {
         t0 = (pr.now_us)();
     }
-    let nraw = fast::fast12_detect(src, cw, ch, cw, thr, corners);
+    let nraw = fast::ee::fast12_detect_ee(src, cw, ch, cw, thr, corners);
     if let Some(pr) = profile.as_deref_mut() {
         pr.fast_us[li] = (pr.now_us)() - t0;
         t0 = (pr.now_us)();
