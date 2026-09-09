@@ -97,9 +97,13 @@ fn group_words_impl(
     let sgn_addr = &SIGN_BYTE as *const u8;
     let b_addr = &b as *const u8;
     let s = scr.0.as_mut_ptr(); // 16-aligned (repr(align(16)))
-    // Slot pointers: pkx windows 0..3, then the c_bx spill.
-    let (s0, s1, s2, s3, s4) =
-        (s, unsafe { s.add(16) }, unsafe { s.add(32) }, unsafe { s.add(48) }, unsafe { s.add(64) });
+    let (s0, s1, s2, s3, s4) = (
+        s,
+        unsafe { s.add(16) },
+        unsafe { s.add(32) },
+        unsafe { s.add(48) },
+        unsafe { s.add(64) },
+    );
     let (mut w0, mut w1, mut w2, mut w3) = (0u32, 0u32, 0u32, 0u32);
     unsafe {
         asm!(
