@@ -70,11 +70,9 @@ pub fn fast12_detect(
     n
 }
 
-/// FAST score of one corner: the largest threshold b at which the pixel is
-/// still a corner, binary-searched over [bstart, 255] exactly like fast.c's
-/// fast12_corner_score() (same 12-contiguous predicate, same search, so the
-/// score is bit-identical). The pixel is assumed to be a corner at `bstart`
-/// (it came from the detector) — that is the search's lower bound.
+/// FAST score of one corner: the largest threshold at which it is still a corner,
+/// binary-searched over [bstart, 255] exactly like fast.c's
+/// fast12_corner_score() (bit-identical; `bstart` is the detector's threshold).
 #[inline]
 fn corner_score(im: &[u8], c: isize, off: &[isize; 16], v: i32, bstart: i32) -> i32 {
     let mut bmin = bstart;
@@ -93,11 +91,9 @@ fn corner_score(im: &[u8], c: isize, off: &[isize; 16], v: i32, bstart: i32) -> 
     }
 }
 
-/// FAST scores of a raster-ordered corner list (one i32 per corner), mirroring
-/// fast.c's fast12_score(): score[n] = largest threshold at which corner n is
-/// still a corner, binary-searched from `b` up to 255. `corners` must have
-/// come from [`fast12_detect`] on `im` at threshold `b` (same stride). Writes
-/// min(corners.len(), scores.len()) scores; returns how many were written.
+/// Scores a raster-ordered corner list (one i32 each), mirroring fast.c's
+/// fast12_score(). `corners` must come from [`fast12_detect`] on `im` at `b`
+/// (same stride); writes min(len) scores and returns how many.
 pub fn fast12_score(
     im: &[u8],
     stride: usize,
@@ -118,20 +114,9 @@ pub fn fast12_score(
     n
 }
 
-/// Non-max suppression over a raster-ordered, scored corner list — a direct
-/// port of fast.c's nonmax_suppression() (same algorithm and guard structure,
-/// same >= rule: a corner dies if any 3x3 neighbour — left/right on its own
-/// row, x in {x-1,x,x+1} on the row above/below — has score >= its own, so
-/// equal-score neighbours mutually suppress). no_std + alloc-free: `rowidx`
-/// is caller scratch with one entry per corner row index (>= the last corner's
-/// y + 1), and survivors are appended to `out` in raster order.
-///
-/// Input contract (do not break): `corners` in raster-scan order (y asc, x
-/// asc within a row — as emitted by [`fast12_detect`]) with `scores[i]` its
-/// score. Returns the total survivor count (stored into `out` up to its
-/// length, first K survivors in order — a truncated store, like
-/// [`fast12_detect`]). Returns 0 and writes nothing if `corners` is empty or
-/// `scores`/`rowidx` are undersized.
+/// Non-max suppression, a direct port of fast.c's nonmax_suppression(): a corner
+/// dies to any 3x3 neighbour of score >= its own. Raster-ordered input (as
+/// [`fast12_detect`] emits); `rowidx` >= last corner y + 1, `out` is a store cap.
 pub fn nonmax_suppression(
     corners: &[Corner],
     scores: &[i32],
@@ -231,14 +216,9 @@ pub fn nonmax_suppression(
     num_nonmax
 }
 
-/// Detect -> score -> non-max suppression in one call: the Rust equivalent of
-/// fast.c's fast12_detect_nonmax(). Returns the surviving corners (raster
-/// order) and their count; `out` is a store cap, like [`fast12_detect`].
-/// Scratch: `corners` holds the raw candidates (must fit the FULL raw list
-/// for exact NMS — if the detector finds more, only the first `corners.len()`
-/// raster corners, i.e. the top of the image, are scored and suppressed),
-/// `scores` >= corners.len() i32s, `rowidx` >= image rows (see
-/// [`nonmax_suppression`]). Returns 0 for no corners or undersized scratch.
+/// Detect -> score -> NMS in one call (fast.c's fast12_detect_nonmax()): returns
+/// the survivor count and stores raster-ordered survivors into `out` (a cap, like
+/// [`fast12_detect`]). `corners` must fit the FULL raw list for exact NMS.
 pub fn fast12_detect_nonmax(
     im: &[u8],
     w: usize,

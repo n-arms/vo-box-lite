@@ -92,7 +92,7 @@ def format_per_level(t: dict) -> str:
     parts = []
     for l, lvl in enumerate(t["levels"]):
         tot = sum(lvl[ph] for ph in VOX2_PHASES)
-        parts.append(f"L{l} {tot}us/{lvl['corners']}feats")
+        parts.append(f"L{l} {tot}us/{lvl['corners']}feats blur={lvl['blur']}")
     return "per level: " + ", ".join(parts)
 
 

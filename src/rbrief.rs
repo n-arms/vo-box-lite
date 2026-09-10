@@ -1,7 +1,6 @@
 //! Rotation-aware BRIEF (rBRIEF): ORB intensity-centroid orientation + rotated
-//! sampling of 256 learned pairs. 1:1 port of extract.c's rbrief_descriptor(),
-//! no_std + alloc-free + no libm. Blur the image once (blur.rs box_blur5x5),
-//! then describe per keypoint; never match all-zero descriptors.
+//! sampling of 256 learned pairs. 1:1 port of extract.c's rbrief_descriptor();
+//! no_std, alloc-free, no libm. Blur first, then describe; all-zero never matches.
 
 /// Border-reject half-width 20 = pattern radius ~18.4 (max pair coord ±13) +
 /// 1px rounding margin — rotated samples always stay in-bounds.

@@ -1,6 +1,6 @@
-//! 5x5 box blur over contiguous grayscale frames (u8, row-major): separable
-//! sliding windows (~2 loads/px, no SIMD), clamp borders, no_std + alloc-free.
-//! `scratch` = one u16 row of `width` (1280 B at VGA — keep in internal SRAM).
+//! 5x5 box blur over contiguous grayscale frames (u8, row-major): separable,
+//! clamped borders, no_std + alloc-free; the two O(pixels) phases are S3 EE/PIE
+//! SIMD (host mirrors are bit-identical). `scratch` = one aligned u16 row.
 
 /// Full kernel width/height (always 5).
 const WINDOW: usize = 5;
@@ -13,6 +13,23 @@ const RADIUS: usize = 2;
 fn div25(s: u16) -> u8 {
     ((s as u32 * 41943 + (1 << 19)) >> 20) as u8
 }
+
+/// Mirror of the EE `/25`: `((s + 12) * 41944) >> 20` == round-half-up `s/25`
+/// for every reachable sum (exhaustively tested). One `vmul.u16` divides 8
+/// lanes; the constants live in statics so `vldbc.16` can broadcast from memory.
+#[inline(always)]
+#[cfg_attr(target_arch = "xtensa", allow(dead_code))]
+fn div25_simd(s: u16) -> u8 {
+    (((s as u32) + 12) * 41944 >> 20) as u8
+}
+
+#[cfg(target_arch = "xtensa")]
+static SIMD_ROUND12: u16 = 12;
+#[cfg(target_arch = "xtensa")]
+static SIMD_INV25: u16 = 41944;
+/// SAR used by `ee.vmul.u16` in the SIMD divide (the `>> 20` above).
+#[cfg(target_arch = "xtensa")]
+const SIMD_SAR: usize = 20;
 
 /// Clamped 25-tap box at pixel (`y`, `x`). Slow but only used for border rows
 /// (≤ 4 per frame) and tiny frames.
@@ -52,45 +69,228 @@ fn vcol_init(src: &[u8], w: usize, vcol: &mut [u16]) {
     }
 }
 
-/// Slide the vertical window down one row: drop source row `drop`, add
-/// source row `add`. Column sums never leave `0..=1275`, so plain u16
-/// arithmetic cannot overflow.
-fn vcol_advance(src: &[u8], w: usize, drop: usize, add: usize, vcol: &mut [u16]) {
-    let a = &src[drop * w..(drop + 1) * w];
-    let b = &src[add * w..(add + 1) * w];
-    for x in 0..w {
-        vcol[x] += b[x] as u16;
-        vcol[x] -= a[x] as u16;
+// ------------------------------------------------------- SIMD block kernels ----
+
+// `${...}` in the asm templates below are Rust operand placeholders (`q0`..`q7`
+// are written literally, as in `fast::ee`: LLVM only names the 8 EE registers,
+// and normal Rust codegen never uses them, so they need no clobber list).
+
+/// Unrolled 8-byte store (slices/`copy_from_slice` outline to calls at
+/// `opt-level="z"` and erase the SIMD win). `x + 8` must be in bounds.
+#[inline(always)]
+fn store8(dst_row: &mut [u8], x: usize, words: [u32; 2]) {
+    let p = dst_row.as_mut_ptr();
+    unsafe {
+        *p.wrapping_add(x) = words[0] as u8;
+        *p.wrapping_add(x + 1) = (words[0] >> 8) as u8;
+        *p.wrapping_add(x + 2) = (words[0] >> 16) as u8;
+        *p.wrapping_add(x + 3) = (words[0] >> 24) as u8;
+        *p.wrapping_add(x + 4) = words[1] as u8;
+        *p.wrapping_add(x + 5) = (words[1] >> 8) as u8;
+        *p.wrapping_add(x + 6) = (words[1] >> 16) as u8;
+        *p.wrapping_add(x + 7) = (words[1] >> 24) as u8;
     }
 }
 
-/// Horizontal 5-tap sliding sum over the column sums `vcol` -> one output
-/// row. Ends are clamped; interior slides `s += v[x+2] - v[x-3]`.
+/// One 8-output interior block: `sum[i] = vcol[x-2+i..=x+2+i]`, `/25`, packed
+/// little-endian. Requires 16-byte-aligned `vcol`, `2 <= x`, `x + 14 <= len`.
+#[cfg(target_arch = "xtensa")]
+#[inline(always)]
+fn simd_out_block8(vcol: &[u16], x: usize) -> [u32; 2] {
+    use core::arch::asm;
+    // `wrapping_add`: the plain `add` carries a `debug_assert` precondition
+    // check that LLVM turns into an unconditional call in the dev build.
+    let a = vcol.as_ptr().wrapping_add(x - 2) as usize;
+    let b = vcol.as_ptr().wrapping_add(x + 6) as usize;
+    let c12 = &SIMD_ROUND12 as *const u16 as usize;
+    let cm = &SIMD_INV25 as *const u16 as usize;
+    let sar = SIMD_SAR;
+    let (mut w0, mut w1) = (0u32, 0u32);
+    unsafe {
+        asm!(
+            // q0/q2 = the two aligned 8-u16 windows around the block.
+            "ee.vld.128.ip q0, {a}, 0",
+            "ee.vld.128.ip q2, {b}, 0",
+            "ee.vldbc.16   q3, {c12}",       // q3 = {12}
+            "ee.vldbc.16   q7, {cm}",        // q7 = {41944}
+            "ee.orq        q5, q0, q0",      // q5 = copy of A (srci.2q shifts in place)
+            "ee.orq        q6, q2, q2",      // q6 = copy of B
+            "ee.vadds.s16  q4, q0, q3",      // acc = vcol[x-2..] + 12  (V0 + round)
+            // Each `srci.2q q6,q5,1` shifts the 32-byte {B:A} right by 2 bytes,
+            // yielding V1..V4 (the windows starting at x-1, x, x+1, x+2).
+            "ee.srci.2q    q6, q5, 1",
+            "ee.vadds.s16  q4, q4, q5",
+            "ee.srci.2q    q6, q5, 1",
+            "ee.vadds.s16  q4, q4, q5",
+            "ee.srci.2q    q6, q5, 1",
+            "ee.vadds.s16  q4, q4, q5",
+            "ee.srci.2q    q6, q5, 1",
+            "ee.vadds.s16  q4, q4, q5",
+            "wsr.sar       {sar}",           // ee.vmul.u16 shifts its product by SAR
+            "ee.vmul.u16   q4, q4, q7",      // q4 = (sum+12)*41944 >> 20  == /25
+            "ee.vunzip.8   q4, q3",          // low 8 bytes = the 8 results
+            "ee.movi.32.a  q4, {w0}, 0",
+            "ee.movi.32.a  q4, {w1}, 1",
+            a = in(reg) a,
+            b = in(reg) b,
+            c12 = in(reg) c12,
+            cm = in(reg) cm,
+            sar = in(reg) sar,
+            w0 = lateout(reg) w0,
+            w1 = lateout(reg) w1,
+            options(nostack, readonly),
+        );
+    }
+    [w0, w1]
+}
+
+/// Host mirror of [`simd_out_block8`] (same exact arithmetic, no asm).
+#[cfg(not(target_arch = "xtensa"))]
+#[inline(always)]
+fn simd_out_block8(vcol: &[u16], x: usize) -> [u32; 2] {
+    let mut bytes = [0u8; 8];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let s = vcol[x - 2 + i] as u32
+            + vcol[x - 1 + i] as u32
+            + vcol[x + i] as u32
+            + vcol[x + 1 + i] as u32
+            + vcol[x + 2 + i] as u32;
+        *byte = div25_simd(s as u16);
+    }
+    [
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    ]
+}
+
+/// One 16-column vertical block: `vcol[x+i] += add[x+i] - drop[x+i]`, `i` in
+/// `0..16`. Full slices + `x` (not `&mut vcol[x..x+16]`) keep `index_mut` out.
+#[cfg(target_arch = "xtensa")]
+#[inline(always)]
+fn simd_vcol_block16(vcol: &mut [u16], x: usize, add: &[u8], drop: &[u8]) {
+    use core::arch::asm;
+    let ap = add.as_ptr().wrapping_add(x) as usize;
+    let dp = drop.as_ptr().wrapping_add(x) as usize;
+    let vl = vcol.as_ptr().wrapping_add(x) as usize; // 16-byte aligned
+    let vh = vl + 16;
+    unsafe {
+        asm!(
+            // Unaligned 16-byte window per row: aligned block + `src.q`.
+            "ee.ld.128.usar.ip q1, {ap}, 16",
+            "ee.vld.128.ip      q7, {ap}, -16",
+            "ee.src.q           q1, q1, q7",
+            "ee.ld.128.usar.ip q4, {dp}, 16",
+            "ee.vld.128.ip      q7, {dp}, -16",
+            "ee.src.q           q4, q4, q7",
+            // `vzip.8` against zero widens u8 -> u16.
+            "ee.zero.q          q0",
+            "ee.vzip.8          q1, q0",     // q1 = add[0..8] (u16), q0 = add[8..16]
+            "ee.zero.q          q7",
+            "ee.vzip.8          q4, q7",     // q4 = drop[0..8], q7 = drop[8..16]
+            // Running sums: values stay in 0..=1530, far from s16 saturation.
+            "ee.vld.128.ip q5, {vl}, 0",
+            "ee.vld.128.ip q6, {vh}, 0",
+            "ee.vadds.s16 q5, q5, q1",
+            "ee.vsubs.s16 q5, q5, q4",
+            "ee.vadds.s16 q6, q6, q0",
+            "ee.vsubs.s16 q6, q6, q7",
+            "ee.vst.128.ip q5, {vl}, 0",
+            "ee.vst.128.ip q6, {vh}, 0",
+            ap = in(reg) ap,
+            dp = in(reg) dp,
+            vl = in(reg) vl,
+            vh = in(reg) vh,
+            options(nostack),
+        );
+    }
+}
+
+/// Host mirror of [`simd_vcol_block16`] (exact: sums stay in 0..=1275 and
+/// `vcol` still holds the dropped row, so wrapping u16 is safe).
+#[cfg(not(target_arch = "xtensa"))]
+#[inline(always)]
+fn simd_vcol_block16(vcol: &mut [u16], x: usize, add: &[u8], drop: &[u8]) {
+    for i in 0..16 {
+        vcol[x + i] = vcol[x + i]
+            .wrapping_add(add[x + i] as u16)
+            .wrapping_sub(drop[x + i] as u16);
+    }
+}
+
+/// The EE kernel needs a 16-byte-aligned `vcol` (`vld`/`vst`); host mirrors
+/// don't care, so they always take the vector path.
+#[inline(always)]
+fn simd_aligned(vcol: *const u16) -> bool {
+    !cfg!(target_arch = "xtensa") || (vcol as usize) & 15 == 0
+}
+
+/// Slide the vertical window one row: `vcol += src[add] - src[drop]`, 16 cols
+/// per EE block. Column sums stay in `0..=1275`, so u16 arithmetic is exact.
+fn vcol_advance(src: &[u8], w: usize, drop: usize, add: usize, vcol: &mut [u16]) {
+    let a = &src[drop * w..(drop + 1) * w];
+    let b = &src[add * w..(add + 1) * w];
+    let mut x = 0usize;
+    if simd_aligned(vcol.as_ptr()) {
+        while x + 16 <= w {
+            // The two aligned blocks under the source window reach up to 15 B
+            // outside it; bow out to scalar on the first/last rows.
+            #[cfg(target_arch = "xtensa")]
+            {
+                let start = src.as_ptr() as usize;
+                let end = start + src.len();
+                let pa = b.as_ptr() as usize + x;
+                let pd = a.as_ptr() as usize + x;
+                if (pa & !15) < start
+                    || (pa & !15) + 32 > end
+                    || (pd & !15) < start
+                    || (pd & !15) + 32 > end
+                {
+                    break;
+                }
+            }
+            simd_vcol_block16(vcol, x, b, a);
+            x += 16;
+        }
+    }
+    for xi in x..w {
+        vcol[xi] += b[xi] as u16;
+        vcol[xi] -= a[xi] as u16;
+    }
+}
+
+/// Horizontal 5-tap over `vcol` -> one output row (clamped ends, EE interior).
 /// Requires `w >= 5`.
 fn out_row_from_vcol(vcol: &[u16], w: usize, dst_row: &mut [u8]) {
     let v = vcol;
     // x = 0, 1: windows (0,0,0,1,2) and (0,0,1,2,3).
     dst_row[0] = div25(3 * v[0] + v[1] + v[2]);
     dst_row[1] = div25(2 * v[0] + v[1] + v[2] + v[3]);
-    // x = 2: window 0..=4, then slide through x = w-3.
-    let mut s: u32 = (v[0] + v[1] + v[2] + v[3] + v[4]) as u32;
-    dst_row[2] = div25(s as u16);
-    for x in 3..w - 2 {
-        // Slide: drop v[x-3], add v[x+2]. s always contains v[x-3] (it is a
-        // 5-window sum), so subtract FIRST — a combined `s += v[x+2] - v[x-3]`
-        // underflows u32 in debug builds whenever the window shrinks.
-        s -= v[x - 3] as u32;
-        s += v[x + 2] as u32;
+    // Interior: EE blocks while a full block + trailing context fits.
+    let mut x = 2usize;
+    if simd_aligned(vcol.as_ptr()) {
+        while x + 14 <= w {
+            let words = simd_out_block8(vcol, x);
+            store8(dst_row, x, words);
+            x += 8;
+        }
+    }
+    while x <= w - 3 {
+        // Direct 5-window (the sliding form is no longer tracked here).
+        let s = v[x - 2] as u32
+            + v[x - 1] as u32
+            + v[x] as u32
+            + v[x + 1] as u32
+            + v[x + 2] as u32;
         dst_row[x] = div25(s as u16);
+        x += 1;
     }
     // x = w-2, w-1: windows (...,w-1,w-1) and (...,w-1,w-1,w-1).
     dst_row[w - 2] = div25(v[w - 4] + v[w - 3] + v[w - 2] + 2 * v[w - 1]);
     dst_row[w - 1] = div25(v[w - 3] + v[w - 2] + 3 * v[w - 1]);
 }
 
-/// 5x5 box blur (clamp borders), grayscale `src` -> `dst` (w*h bytes each;
-/// src = camera PSRAM fb, dst = second PSRAM buffer). `scratch` >= width u16.
-/// False on invalid sizes; success fills `dst[..w*h]`.
+/// 5x5 box blur (clamped borders), `src` -> `dst` (w*h bytes each). `scratch`
+/// >= width u16, 16-byte aligned. False on invalid sizes.
 pub fn box_blur5x5(
     src: &[u8],
     dst: &mut [u8],
@@ -170,13 +370,59 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn div25_is_round_half_up_for_all_sums() {
         for s in 0..=25 * 255 {
             assert_eq!(div25(s as u16), ((s + 12) / 25) as u8, "s={s}");
         }
+    }
+
+    #[test]
+    fn simd_div25_matches_div25_for_all_sums() {
+        for s in 0..=25 * 255 {
+            assert_eq!(
+                div25_simd(s as u16),
+                div25(s as u16),
+                "s={s} (the EE vmul.u16 divide must be exact)"
+            );
+        }
+    }
+
+    /// The EE block builds the five shifted windows from two aligned loads via
+    /// `srci.2q`; check it equals the direct 5-tap sum on random interiors.
+    #[test]
+    fn simd_out_block8_matches_direct_windows() {
+        let mut rng = Lcg(0x1234_5678_9abc_def0);
+        for w in [16usize, 17, 23, 32, 33, 640] {
+            let mut vcol = vec![0u16; w];
+            for _ in 0..4 {
+                for v in vcol.iter_mut() {
+                    *v = rng.next() as u16 * 5; // <= 1275
+                }
+                let mut x = 2usize;
+                while x + 14 <= w {
+                    let bytes = simd_out_block8(&vcol, x).map(u32::to_le_bytes);
+                    for i in 0..8 {
+                        let s = vcol[x - 2 + i] as u32
+                            + vcol[x - 1 + i] as u32
+                            + vcol[x + i] as u32
+                            + vcol[x + 1 + i] as u32
+                            + vcol[x + 2 + i] as u32;
+                        assert_eq!(bytes[i / 4][i % 4], div25(s as u16), "w={w} x={x} i={i}");
+                    }
+                    x += 8;
+                }
+            }
+        }
+    }
+
+    /// 16-byte-aligned scratch so the EE-dispatch branch is the one tested
+    /// (host mirrors have no alignment requirement, but production does).
+    fn aligned_scratch(w: usize) -> (Vec<u16>, usize) {
+        let buf = vec![0u16; w + 8];
+        let base = buf.as_ptr() as usize;
+        let off = ((16 - (base & 15)) & 15) / 2;
+        (buf, off)
     }
 
     #[test]
@@ -191,7 +437,8 @@ mod tests {
             (5, 6),      // one interior col? w == 5, h == 6
             (6, 5),      // one interior row
             (7, 9),      // small interior
-            (16, 16),    // regular
+            (16, 16),    // first full EE blocks
+            (17, 16),    // odd width
             (33, 17),    // odd
             (640, 480),  // VGA camera frame
         ];
@@ -202,9 +449,10 @@ mod tests {
                 let mut src = vec![0u8; n];
                 rng.fill(&mut src);
                 let mut dst = vec![0xAAu8; n];
-                let mut scratch = vec![0u16; w];
+                let (mut scratch, off) = aligned_scratch(w);
+                let vcol = &mut scratch[off..off + w];
                 assert!(
-                    box_blur5x5(&src, &mut dst, w, h, &mut scratch),
+                    box_blur5x5(&src, &mut dst, w, h, vcol),
                     "size {w}x{h}"
                 );
                 let expect = naive_box_blur(&src, w, h);
@@ -233,8 +481,8 @@ mod tests {
         let h = 20;
         let src = vec![137u8; w * h];
         let mut dst = vec![0u8; w * h];
-        let mut scratch = vec![0u16; w];
-        assert!(box_blur5x5(&src, &mut dst, w, h, &mut scratch));
+        let (mut scratch, off) = aligned_scratch(w);
+        assert!(box_blur5x5(&src, &mut dst, w, h, &mut scratch[off..off + w]));
         assert_eq!(dst, src);
     }
 }

@@ -1,11 +1,6 @@
-//! Fixed-ratio downsamplers for the pyramid:
-//! - [`downscale_65`]: 6:5, byte-identical to slam-exp's `downscale_65_sse`
-//!   (separable two-tap filter, weights ×128 with exact `>>7`, 6 px/rows -> 5;
-//!   h-pass scratch = u8, dw-strided).
-//! - [`downscale_4x4`]: INTER_AREA-style 4x4-block mean (fixed 4:1, `>>4`).
-//! Both no_std, alloc-free, u16 math, no clamping; trailing cols/rows beyond
-//! the last full block are never read. Caller-owned dst; dst must not alias
-//! src/scratch (in-place is unsupported).
+//! Fixed-ratio downsamplers: [`downscale_65`] (6:5, byte-identical to slam-exp's
+//! `downscale_65_sse`) and [`downscale_4x4`] (INTER_AREA-style block mean).
+//! no_std, alloc-free, u16 math, truncating; dst must not alias src/scratch.
 
 /// Weights for the first (earlier) sample of each output phase.
 const W1: [u16; 5] = [107, 85, 64, 43, 21];
@@ -94,14 +89,9 @@ pub const fn downscale_4x4_size(n: usize) -> usize {
     n / 4
 }
 
-/// INTER_AREA-style 4x4 downsample: `dst[y][x] = mean(src[4y..4y+4][4x..4x+4])`
-/// over non-overlapping blocks — the exact-integer-ratio form of OpenCV's
-/// `INTER_AREA` (dst dims = `sw/4`, `sh/4`; trailing partial rows/cols are
-/// never read, like the 6:5). Truncating mean via `>> 4`: the sum of 16 u8
-/// is ≤ 4080 (fits u16) and the exact shift reproduces a C `s / 16` division,
-/// matching the truncation convention of the rest of the pipeline. False on
-/// invalid sizes; axis < 4: valid empty output, nothing written. No scratch:
-/// each output pixel reads its own 4x4 block directly from src.
+/// INTER_AREA-style 4x4 block mean, `dst = sw/4 x sh/4` (exact-integer-ratio
+/// `INTER_AREA`). Truncating `>>4` (16-u8 sum fits u16) matches a C `s/16`. No
+/// scratch; trailing partial rows/cols unread. False on bad sizes, empty if axis < 4.
 pub fn downscale_4x4(src: &[u8], sw: usize, sh: usize, dst: &mut [u8]) -> bool {
     let dw = downscale_4x4_size(sw);
     let dh = downscale_4x4_size(sh);

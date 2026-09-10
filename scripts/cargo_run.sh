@@ -31,6 +31,19 @@ echo "== vo-box: flash + console (Windows COM port) =="
 # usbipd attach fails with "Device busy (exported)". Self-heal here.
 powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.Name -like 'python*' -and \$_.CommandLine -like '*serial_monitor.py*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" >/dev/null 2>&1 || true
 
+# --- 0b) refuse to run while a previous espflash is wedged ------------------
+# A D-state espflash parks in usb_kill_urb and pins the ttyACM node, so a new
+# run just hangs at "Connecting..." (signals can't clear it: replug / `wsl
+# --shutdown`). Abort clearly instead of hanging.
+if ps -eo stat=,cmd= | awk '$1 ~ /^D/ && /espflash/ {f=1} END {exit !f}'; then
+    echo "ERROR: a previous espflash is stuck in D state (usbipd/vhci wedge):" >&2
+    ps -eo pid,stat,etimes,wchan:20,cmd | grep '[e]spflash' >&2 || true
+    echo "  Recovery: unplug the ESP32-S3 -> 'wsl --shutdown' from Windows ->" >&2
+    echo "  reopen WSL -> replug -> 'usbipd attach --wsl --busid $USBIPD_BUSID' -> re-run." >&2
+    exit 1
+fi
+pkill -9 -x espflash 2>/dev/null || true   # interrupted, non-wedged leftovers
+
 # --- 1) ensure the board is attached to WSL for flashing --------------------
 if [ -z "$(ls /dev/ttyACM* 2>/dev/null | head -1)" ]; then
     echo "Attaching the board to WSL (usbipd attach --busid $USBIPD_BUSID)..."
@@ -42,6 +55,11 @@ if [ -z "$port" ]; then
     echo "ERROR: board not attached to WSL. Is it plugged in? Is COM5 free on" >&2
     echo "       Windows (no stale serial_monitor.py holding it)?" >&2
     exit 1
+fi
+# More than one node means a wedged session left a ghost; `ls -t` picks the
+# newest (the live one), but say so loudly in case the ghost is all that's left.
+if [ "$(ls /dev/ttyACM* 2>/dev/null | wc -l)" -gt 1 ]; then
+    echo "WARNING: multiple ttyACM nodes ($(ls /dev/ttyACM* 2>/dev/null | tr '\n' ' ')); using newest $port" >&2
 fi
 echo "port: $port"
 
