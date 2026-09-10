@@ -1,11 +1,11 @@
-//! SoftAP + TCP map-task server: the MCU idles until the laptop sends an STRT
-//! command, then streams VOX2 frame+feature records at the requested pace for
-//! the requested duration and ends with a VOXD "done" record (see receive_map).
+//! SoftAP + TCP server: on connect the laptop sends STRT (map run: streams VOX2
+//! frames, ends with VOXD) or MAPU (upload a built map + intrinsics; MCU stores
+//! it and idles in localize mode). See scripts/receive_map.py for the protocol.
 
 #[path = "../camera.rs"]
 mod camera;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use esp_idf_svc::wifi::{
 use vo_box_lite::downscale;
 use vo_box_lite::fast;
 use vo_box_lite::pyramid::{self, Feature};
+use vo_box_lite::rbrief;
 
 /// SoftAP credentials the laptop joins with (WPA2 passphrase must be >= 8 chars).
 const AP_SSID: &str = "vo-box";
@@ -31,13 +32,22 @@ const AP_IP_FALLBACK: Ipv4Addr = Ipv4Addr::new(192, 168, 71, 1);
 /// Command magic laptop -> MCU, sent right after connect: `u32 LE n | "STRT"`
 /// [+ payload]. The MCU streams nothing until STRT arrives.
 const MAGIC_START: &[u8; 4] = b"STRT";
-/// STRT payload defaults (the command can override; see read_start_command):
+/// STRT payload defaults (the command can override; see read_command):
 /// 300 s run, one frame per 1000 ms (0 = max rate), 60 s STRT timeout.
 const DEFAULT_DURATION_S: u64 = 300;
 const DEFAULT_INTERVAL_MS: u64 = 1000;
 const START_TIMEOUT_S: u64 = 60;
 /// Record magic for the final "done mapping" record.
 const MAGIC_DONE: &[u8; 4] = b"VOXD";
+/// Laptop -> MCU map upload: `u32 LE n | "MAPU" | u8 model | 4 x f32 params |
+/// u32 n_points | n_points x {f32 x,y,z, 32 B desc}` (n = full record length).
+const MAGIC_MAP_UPLOAD: &[u8; 4] = b"MAPU";
+/// MCU -> laptop map-upload ack: `u32 LE n` (= 8) | b"MAPK" | u32 LE n_points.
+const MAGIC_MAP_OK: &[u8; 4] = b"MAPK";
+/// Camera model ids accepted in a MAPU header (COLMAP `SIMPLE_RADIAL` only).
+const CAMERA_MODEL_SIMPLE_RADIAL: u8 = 1;
+/// Sanity cap on uploaded points (44 B each) to bound the PSRAM allocation.
+const MAX_MAP_POINTS: usize = 100_000;
 /// Record magic for frame+features (VOX2).
 const MAGIC: &[u8; 4] = b"VOX2";
 /// esp32-camera PIXFORMAT_GRAYSCALE (the only format we configure).
@@ -124,13 +134,15 @@ fn main() -> Result<(), EspError> {
     feature_server(listener, camera.as_ref())
 }
 
-/// Serve one connection = one map run: wait for the laptop's STRT command,
-/// stream paced VOX2 frames until the run deadline, then send the VOXD done
-/// record and drop the connection (re-accept for the next run).
+/// Serve one connection = one command: STRT streams paced VOX2 frames until the
+/// run deadline then sends VOXD; MAPU stores the uploaded map and acks. Either
+/// way the connection is dropped and the next one accepted.
 fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
     // Pipeline buffers are sized for the downsampled level-0 dims and reused
     // every frame (no per-frame allocation; see pyramid::extract_pyramid).
     let mut pipe: Option<MapPipeline> = None;
+    // Last uploaded map; the localize task (not written) will consume it.
+    let mut map: Option<LocalMap> = None;
     loop {
         let (mut stream, peer) = match listener.accept() {
             Ok(conn) => conn,
@@ -140,7 +152,11 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                 continue;
             }
         };
-        log::info!("laptop connected: {peer} — waiting for its STRT command");
+        log::info!("laptop connected: {peer} — waiting for its command");
+        match map.as_ref() {
+            Some(m) => log::info!("localize map loaded ({} points)", m.points.len()),
+            None => log::info!("no localize map loaded"),
+        }
         // Disable Nagle (pairs with the enlarged lwIP send buffer in sdkconfig).
         if let Err(e) = stream.set_nodelay(true) {
             log::warn!("set_nodelay failed ({e})");
@@ -150,16 +166,29 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
         }
         let p = pipe.as_mut().unwrap();
 
-        // Idle until the laptop kicks the map task off (streams nothing
-        // before that). Clean disconnect -> Ok(None); timeout/garbage -> Err.
-        let (dur_s, interval_ms) = match read_start_command(&mut stream) {
-            Ok(Some(params)) => params,
+        // The MCU streams nothing until a command arrives: STRT starts a run,
+        // MAPU stores a map. Clean disconnect -> Ok(None); timeout/garbage -> Err.
+        let (dur_s, interval_ms) = match read_command(&mut stream) {
+            Ok(Some(Command::Start { duration_s, interval_ms })) => (duration_s, interval_ms),
+            Ok(Some(Command::MapUpload(m))) => {
+                let n_points = m.points.len() as u32;
+                log::info!("map upload: {n_points} points, model {}, params {:?}",
+                           m.model, m.params);
+                map = Some(m);
+                build_map_ok_record(&mut p.tx, n_points);
+                if let Err(e) = send_record(&mut stream, &p.tx) {
+                    log::warn!("map ack send failed ({e})");
+                } else {
+                    log::info!("map stored — localize mode (idle until the next STRT)");
+                }
+                continue;
+            }
             Ok(None) => {
-                log::info!("client {peer} disconnected before sending STRT");
+                log::info!("client {peer} disconnected before sending a command");
                 continue;
             }
             Err(e) => {
-                log::warn!("waiting for STRT from {peer} failed ({e}); dropping");
+                log::warn!("waiting for a command from {peer} failed ({e}); dropping");
                 continue;
             }
         };
@@ -287,33 +316,60 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
     }
 }
 
-/// Read the laptop's start command (length-prefixed records, laptop -> MCU).
-/// Returns Ok(Some((duration_s, interval_ms))) on STRT, Ok(None) if the
-/// client disconnects before sending anything, Err on timeout / bad record.
-fn read_start_command(stream: &mut TcpStream) -> std::io::Result<Option<(u64, u64)>> {
+/// One command on a fresh laptop connection (length-prefixed record).
+enum Command {
+    Start { duration_s: u64, interval_ms: u64 },
+    MapUpload(LocalMap),
+}
+
+/// Uploaded map: COLMAP-refined intrinsics + 3D points with rBRIEF descriptors.
+/// Held in PSRAM until the next upload / reboot.
+struct LocalMap {
+    model: u8,
+    /// SIMPLE_RADIAL params: f, cx, cy, k1.
+    params: [f32; 4],
+    points: Vec<LocalMapPoint>,
+}
+
+#[allow(dead_code)] // consumed by the localize task (not written yet)
+struct LocalMapPoint {
+    xyz: [f32; 3],
+    desc: rbrief::Descriptor,
+}
+
+/// Read the laptop's command (STRT = map run, MAPU = map upload). Ok(None) on a
+/// clean disconnect, Err on timeout / bad record. MAPU leaves the stream
+/// blocking; STRT leaves it non-blocking.
+fn read_command(stream: &mut TcpStream) -> std::io::Result<Option<Command>> {
     let deadline = Instant::now() + Duration::from_secs(START_TIMEOUT_S);
     stream.set_nonblocking(true)?;
-    loop {
-        let mut len_buf = [0u8; 4];
-        match read_exact_poll(stream, &mut len_buf, deadline) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let n = u32::from_le_bytes(len_buf) as usize;
+    let mut len_buf = [0u8; 4];
+    match read_exact_poll(stream, &mut len_buf, deadline) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let n = u32::from_le_bytes(len_buf) as usize;
+    let mut magic = [0u8; 4];
+    if n < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad command length {n}"),
+        ));
+    }
+    read_exact_poll(stream, &mut magic, deadline)?;
+    if &magic == MAGIC_START {
         if !(4..=12).contains(&n) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("bad command record length {n}"),
+                format!("bad STRT length {n}"),
             ));
         }
         let mut body = [0u8; 12];
-        read_exact_poll(stream, &mut body[..n], deadline)?;
-        if &body[..4] != MAGIC_START {
-            log::warn!("ignoring unknown command {:?}", &body[..4]);
-            continue; // keep waiting for a valid STRT
+        if n > 4 {
+            read_exact_poll(stream, &mut body[4..n], deadline)?;
         }
-        // Payload (optional): u32 duration_s, u32 interval_ms (see const docs).
+        // Optional payload: u32 duration_s, u32 interval_ms (0 = max rate).
         let mut dur_s = DEFAULT_DURATION_S;
         let mut interval_ms = DEFAULT_INTERVAL_MS;
         if n >= 8 {
@@ -325,8 +381,64 @@ fn read_start_command(stream: &mut TcpStream) -> std::io::Result<Option<(u64, u6
         if n >= 12 {
             interval_ms = u32::from_le_bytes(body[8..12].try_into().unwrap()) as u64;
         }
-        return Ok(Some((dur_s, interval_ms)));
+        return Ok(Some(Command::Start { duration_s: dur_s, interval_ms }));
     }
+    if &magic == MAGIC_MAP_UPLOAD {
+        stream.set_nonblocking(false)?; // large body: read it blocking
+        return Ok(Some(Command::MapUpload(read_map_upload(stream, n)?)));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("unknown command {magic:?}"),
+    ))
+}
+
+/// Parse a MAPU body (magic already read; `n` = full record length): u8 model,
+/// 4 x f32 params, u32 n_points, then n_points x {f32 x,y,z, 32 B descriptor}.
+fn read_map_upload(stream: &mut TcpStream, n: usize) -> std::io::Result<LocalMap> {
+    const HEADER: usize = 1 + 4 * 4 + 4;
+    if n < 4 + HEADER {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("map upload record too short ({n} bytes)"),
+        ));
+    }
+    let mut hdr = [0u8; HEADER];
+    stream.read_exact(&mut hdr)?;
+    let model = hdr[0];
+    if model != CAMERA_MODEL_SIMPLE_RADIAL {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported camera model id {model}"),
+        ));
+    }
+    let mut params = [0f32; 4];
+    for (i, p) in params.iter_mut().enumerate() {
+        *p = f32::from_le_bytes(hdr[1 + i * 4..5 + i * 4].try_into().unwrap());
+    }
+    let n_points = u32::from_le_bytes(hdr[17..21].try_into().unwrap()) as usize;
+    let body_bytes = n - 4 - HEADER;
+    if n_points > MAX_MAP_POINTS || body_bytes != n_points * 44 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("map point count {n_points} != {body_bytes} B payload"),
+        ));
+    }
+    let mut points = Vec::with_capacity(n_points);
+    let mut buf = [0u8; 44];
+    for _ in 0..n_points {
+        stream.read_exact(&mut buf)?;
+        let mut xyz = [0f32; 3];
+        for (i, v) in xyz.iter_mut().enumerate() {
+            *v = f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        let mut desc = [0u32; 8];
+        for (w, d) in desc.iter_mut().enumerate() {
+            *d = u32::from_le_bytes(buf[12 + w * 4..16 + w * 4].try_into().unwrap());
+        }
+        points.push(LocalMapPoint { xyz, desc });
+    }
+    Ok(LocalMap { model, params, points })
 }
 
 /// Read exactly `buf.len()` bytes, tolerating WouldBlock (non-blocking socket)
@@ -498,6 +610,15 @@ fn build_done_record(buf: &mut Vec<u8>, frames: u64, features: u64) {
     buf.extend_from_slice(MAGIC_DONE);
     buf.extend_from_slice(&(frames as u32).to_le_bytes());
     buf.extend_from_slice(&(features as u32).to_le_bytes());
+}
+
+/// Assemble the MAPK map-upload ack into `buf`: length | magic | n_points.
+fn build_map_ok_record(buf: &mut Vec<u8>, n_points: u32) {
+    let payload = 8;
+    buf.clear();
+    buf.extend_from_slice(&(payload as u32).to_le_bytes());
+    buf.extend_from_slice(MAGIC_MAP_OK);
+    buf.extend_from_slice(&n_points.to_le_bytes());
 }
 
 /// Write `record`, returning the longest single write() stall in ms (a
