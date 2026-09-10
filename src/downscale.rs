@@ -7,6 +7,11 @@ const W1: [u16; 5] = [107, 85, 64, 43, 21];
 /// Weights for the second (later) sample; `W2[k] == W1[4-k]`.
 const W2: [u16; 5] = [21, 43, 64, 85, 107];
 
+/// True when the EE/PIE SIMD 6:5 kernels are compiled in (xtensa target).
+pub const fn downscale65_simd_available() -> bool {
+    cfg!(target_arch = "xtensa")
+}
+
 /// Output size for one axis of the fixed 6:5 ratio: `5 * (n / 6)`.
 #[inline]
 pub const fn downscale_65_size(n: usize) -> usize {
@@ -14,47 +19,202 @@ pub const fn downscale_65_size(n: usize) -> usize {
 }
 
 /// Two-tap weighted average of one output phase: `(W1[k]*a + W2[k]*b) >> 7`.
-/// Sum ≤ 255*128 = 32640 fits u16; the plain unsigned shift reproduces the
-/// C `>>7` (== `_mm_srai_epi16` on the SIMD version) exactly.
+/// Sum ≤ 255*128 = 32640 fits u16, so the scalar tail / host path is exact.
 #[inline(always)]
 fn phase(k: usize, a: u8, b: u8) -> u8 {
     ((W1[k] * a as u16 + W2[k] * b as u16) >> 7) as u8
 }
 
+/// True when both 16-byte aligned blocks under an unaligned EE window at `ptr`
+/// stay inside `[start, end)` (the loads span `[ptr & !15, ptr & !15 + 32)`).
+#[inline(always)]
+fn win_ok(ptr: usize, start: usize, end: usize) -> bool {
+    let a = ptr & !15;
+    a >= start && a + 32 <= end
+}
+
+/// 16-byte-aligned tap rows: `HW*` per-lane h-pass (tail lanes 0), `VW*[k]`
+/// v-pass row-k broadcast to all 8 lanes.
+#[repr(align(16))]
+struct V8([u16; 8]);
+static HW1: V8 = V8([107, 85, 64, 43, 21, 0, 0, 0]);
+static HW2: V8 = V8([21, 43, 64, 85, 107, 0, 0, 0]);
+static VW1: [V8; 5] = [V8([107; 8]), V8([85; 8]), V8([64; 8]), V8([43; 8]), V8([21; 8])];
+static VW2: [V8; 5] = [V8([21; 8]), V8([43; 8]), V8([64; 8]), V8([85; 8]), V8([107; 8])];
+#[cfg(target_arch = "xtensa")]
+static VONE: V8 = V8([1; 8]);
+
+/// Latched once any EE group runs, so the app can prove the SIMD kernel (not a
+/// stale scalar build) executed; one relaxed store per `downscale_65` call.
+#[cfg(target_arch = "xtensa")]
+static SIMD_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// One relaxed store per `downscale_65` call (never inside the group loops).
+fn mark_simd_used(used: bool) {
+    #[cfg(target_arch = "xtensa")]
+    if used {
+        SIMD_USED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    let _ = used;
+}
+
+/// True once the EE kernel has run a group (host always false).
+pub fn downscale65_simd_used() -> bool {
+    #[cfg(target_arch = "xtensa")]
+    {
+        SIMD_USED.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        false
+    }
+}
+
+/// 8 raw byte stores (slices/`copy_from_slice` outline to calls at the dev
+/// profile's `opt-level="z"`; see `blur::store8`). `x + 8` must be in bounds.
+#[inline(always)]
+fn store8(dst_row: &mut [u8], x: usize, w: [u32; 2]) {
+    let p = dst_row.as_mut_ptr();
+    unsafe {
+        *p.wrapping_add(x) = w[0] as u8;
+        *p.wrapping_add(x + 1) = (w[0] >> 8) as u8;
+        *p.wrapping_add(x + 2) = (w[0] >> 16) as u8;
+        *p.wrapping_add(x + 3) = (w[0] >> 24) as u8;
+        *p.wrapping_add(x + 4) = w[1] as u8;
+        *p.wrapping_add(x + 5) = (w[1] >> 8) as u8;
+        *p.wrapping_add(x + 6) = (w[1] >> 16) as u8;
+        *p.wrapping_add(x + 7) = (w[1] >> 24) as u8;
+    }
+}
+
+/// One EE window pair: widen each window's low 8 bytes, apply tap rows `wa`/`wb`,
+/// sum exactly then `>>7` (products ≤ 27285, sum ≤ 32640). Caller's `win_ok`
+/// must cover both loads; `wa`/`wb` are per-lane (h) or broadcast (v) rows.
+#[cfg(target_arch = "xtensa")]
+#[inline(always)]
+fn simd_pair8(src: &[u8], a: usize, b: usize, wa: &[u16; 8], wb: &[u16; 8]) -> [u32; 2] {
+    use core::arch::asm;
+    let (ap, bp) = (src.as_ptr().wrapping_add(a) as usize, src.as_ptr().wrapping_add(b) as usize);
+    let (wap, wbp) = (wa.as_ptr() as usize, wb.as_ptr() as usize);
+    let one = &VONE.0[0] as *const u16 as usize;
+    let (sar0, sar7) = (0usize, 7usize);
+    let (mut lo, mut hi) = (0u32, 0u32);
+    unsafe {
+        asm!(
+            "ee.vld.128.ip q6, {wap}, 0",
+            "ee.vld.128.ip q7, {wbp}, 0",
+            "ee.vldbc.16    q5, {one}",
+            "ee.ld.128.usar.ip q0, {ap}, 16",
+            "ee.vld.128.ip     q1, {ap}, -16",
+            "ee.src.q          q0, q0, q1",
+            "ee.ld.128.usar.ip q1, {bp}, 16",
+            "ee.vld.128.ip     q2, {bp}, -16",
+            "ee.src.q          q1, q1, q2",
+            "ee.zero.q         q2",
+            "ee.vzip.8         q0, q2",
+            "ee.zero.q         q3",
+            "ee.vzip.8         q1, q3",
+            "wsr.sar           {sar0}",
+            "ee.vmul.u16       q0, q0, q6",
+            "ee.vmul.u16       q1, q1, q7",
+            "ee.vadds.s16      q0, q0, q1",
+            "wsr.sar           {sar7}",
+            "ee.vmul.u16       q0, q0, q5",
+            "ee.vunzip.8       q0, q1",
+            "ee.movi.32.a      q0, {lo}, 0",
+            "ee.movi.32.a      q0, {hi}, 1",
+            ap = in(reg) ap,
+            bp = in(reg) bp,
+            wap = in(reg) wap,
+            wbp = in(reg) wbp,
+            one = in(reg) one,
+            sar0 = in(reg) sar0,
+            sar7 = in(reg) sar7,
+            lo = lateout(reg) lo,
+            hi = lateout(reg) hi,
+            options(nostack, readonly),
+        );
+    }
+    [lo, hi]
+}
+
+/// Host mirror of [`simd_pair8`] (same exact arithmetic, no asm).
+#[cfg(not(target_arch = "xtensa"))]
+#[inline(always)]
+fn simd_pair8(src: &[u8], a: usize, b: usize, wa: &[u16; 8], wb: &[u16; 8]) -> [u32; 2] {
+    let mut bytes = [0u8; 8];
+    for (j, out) in bytes.iter_mut().enumerate() {
+        let s = wa[j] as u32 * src[a + j] as u32 + wb[j] as u32 * src[b + j] as u32;
+        *out = (s >> 7) as u8;
+    }
+    [
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    ]
+}
+
 /// Pass 1 (horizontal): src (sw) -> tmp (dw x sh), each 6-px group -> 5 px,
 /// `t[5g+k] = (W1[k]*s[6g+k] + W2[k]*s[6g+k+1]) >> 7`. Sizes pre-validated.
-fn hpass(src: &[u8], sw: usize, sh: usize, dw: usize, tmp: &mut [u8]) {
+/// EE groups where the read window is in-bounds; the last group stays scalar so
+/// the 8-byte store (3 zero lanes) never leaves the row.
+fn hpass(src: &[u8], sw: usize, sh: usize, dw: usize, tmp: &mut [u8]) -> bool {
     let groups = dw / 5; // == sw / 6
+    let start = src.as_ptr() as usize;
+    let end = start + src.len();
+    let mut used = false;
     for y in 0..sh {
-        let row = &src[y * sw..];
         let t = &mut tmp[y * dw..];
         for g in 0..groups {
-            let i = 6 * g;
+            let i = y * sw + 6 * g;
             let o = 5 * g;
-            // k = 0..4 unrolled so the compiler folds the constant weights.
-            t[o + 0] = phase(0, row[i + 0], row[i + 1]);
-            t[o + 1] = phase(1, row[i + 1], row[i + 2]);
-            t[o + 2] = phase(2, row[i + 2], row[i + 3]);
-            t[o + 3] = phase(3, row[i + 3], row[i + 4]);
-            t[o + 4] = phase(4, row[i + 4], row[i + 5]);
+            let pa = start + i;
+            if 5 * g + 8 <= dw && win_ok(pa, start, end) && win_ok(pa + 1, start, end) {
+                used = true;
+                store8(t, o, simd_pair8(src, i, i + 1, &HW1.0, &HW2.0));
+            } else {
+                t[o + 0] = phase(0, src[i + 0], src[i + 1]);
+                t[o + 1] = phase(1, src[i + 1], src[i + 2]);
+                t[o + 2] = phase(2, src[i + 2], src[i + 3]);
+                t[o + 3] = phase(3, src[i + 3], src[i + 4]);
+                t[o + 4] = phase(4, src[i + 4], src[i + 5]);
+            }
         }
     }
+    used
 }
 
 /// Pass 2 (vertical): tmp (strided dw) -> dst, each 6-row block -> 5 rows,
 /// `dst[5b+k][x] = (W1[k]*tmp[6b+k][x] + W2[k]*tmp[6b+k+1][x]) >> 7`. Pre-validated.
-fn vpass(tmp: &[u8], dw: usize, dh: usize, dst: &mut [u8]) {
+fn vpass(tmp: &[u8], dw: usize, dh: usize, dst: &mut [u8]) -> bool {
     let blocks = dh / 5; // == sh / 6
+    let t0 = tmp.as_ptr() as usize;
+    let t1 = t0 + tmp.len();
+    let mut used = false;
     for b in 0..blocks {
         for k in 0..5 {
-            let r0 = &tmp[(6 * b + k) * dw..(6 * b + k + 1) * dw];
-            let r1 = &tmp[(6 * b + k + 1) * dw..(6 * b + k + 2) * dw];
+            let r0 = (6 * b + k) * dw;
+            let r1 = r0 + dw;
             let d = &mut dst[(5 * b + k) * dw..(5 * b + k + 1) * dw];
-            for (x, px) in d.iter_mut().enumerate() {
-                *px = phase(k, r0[x], r1[x]);
+            let mut x = 0usize;
+            while x + 8 <= dw {
+                if win_ok(t0 + r0 + x, t0, t1) && win_ok(t0 + r1 + x, t0, t1) {
+                    used = true;
+                    store8(d, x, simd_pair8(tmp, r0 + x, r1 + x, &VW1[k].0, &VW2[k].0));
+                } else {
+                    for j in 0..8 {
+                        d[x + j] = phase(k, tmp[r0 + x + j], tmp[r1 + x + j]);
+                    }
+                }
+                x += 8;
+            }
+            while x < dw {
+                d[x] = phase(k, tmp[r0 + x], tmp[r1 + x]);
+                x += 1;
             }
         }
     }
+    used
 }
 
 /// 6:5 downsample src (sw x sh) -> dst (dw x dh) with sizes from the fixed
@@ -78,8 +238,9 @@ pub fn downscale_65(
         return false;
     }
     // dw/dh == 0 (axis < 6): hpass/vpass have no groups and no-op.
-    hpass(src, sw, sh, dw, tmp);
-    vpass(tmp, dw, dh, dst);
+    let h_used = hpass(src, sw, sh, dw, tmp);
+    let v_used = vpass(tmp, dw, dh, dst);
+    mark_simd_used(h_used | v_used);
     true
 }
 
@@ -354,6 +515,37 @@ mod tests {
                     naive_downscale_65(&src, sw, sh),
                     "size {sw}x{sh} trial {trial}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn simd_pair8_matches_phase() {
+        // Both tap layouts (per-lane h-pass, broadcast v-pass) match the scalar phase.
+        let mut rng = Lcg(0xfeed_face_dead_beef);
+        let (dw, sh) = (40usize, 24usize);
+        let mut tmp = vec![0u8; dw * sh];
+        rng.fill(&mut tmp);
+        for off in 0..(tmp.len() - 16) {
+            let bytes = simd_pair8(&tmp, off, off + 1, &HW1.0, &HW2.0).map(u32::to_le_bytes);
+            for j in 0..8 {
+                let (w1, w2) = if j < 5 { (W1[j], W2[j]) } else { (0, 0) };
+                let s = w1 as u32 * tmp[off + j] as u32 + w2 as u32 * tmp[off + j + 1] as u32;
+                assert_eq!(bytes[j / 4][j % 4], (s >> 7) as u8, "off {off} j {j}");
+            }
+        }
+        for b in 0..(sh / 6) {
+            for k in 0..5 {
+                let (r0, r1) = ((6 * b + k) * dw, (6 * b + k + 1) * dw);
+                let mut x = 0usize;
+                while x + 8 <= dw {
+                    let bytes = simd_pair8(&tmp, r0 + x, r1 + x, &VW1[k].0, &VW2[k].0)
+                        .map(u32::to_le_bytes);
+                    for j in 0..8 {
+                        assert_eq!(bytes[j / 4][j % 4], phase(k, tmp[r0 + x + j], tmp[r1 + x + j]));
+                    }
+                    x += 8;
+                }
             }
         }
     }

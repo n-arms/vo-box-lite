@@ -63,6 +63,10 @@ fn main() -> Result<(), EspError> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     log::info!("=== vo-box-lite: feature stream (QXGA 2048x1536 -> 4x4 -> 512x384 pyramid) ===");
+    log::info!(
+        "downscale_65: {} kernel (pyramid 6:5 downsampling)",
+        if downscale::downscale65_simd_available() { "EE/PIE SIMD" } else { "scalar" }
+    );
 
     // ---- SoftAP: WIFI_MODE_AP, no STA ----
     let peripherals = Peripherals::take()?;
@@ -172,6 +176,7 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
         let mut sent = 0u64;
         let mut feats_sent = 0u64;
         let mut interrupted = false; // laptop dropped mid-run
+        let mut logged_kernel = false; // one-shot downscale-kernel proof
         while Instant::now() < deadline {
             let frame_start = Instant::now();
             let cam = match camera {
@@ -193,6 +198,17 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                     continue;
                 }
             };
+            // One-shot first-frame proof that the 6:5 EE kernel ran (not hot-loop).
+            if !logged_kernel {
+                logged_kernel = true;
+                let ds65: u64 = prof.downscale_us.iter().sum();
+                log::info!(
+                    "downscale_65 check: {} compiled; {ds65} us over {} 6:5 levels this frame{}",
+                    if downscale::downscale65_simd_available() { "EE/PIE SIMD" } else { "scalar" },
+                    pyramid::LEVELS - 1,
+                    if downscale::downscale65_simd_used() { "" } else { " [SIMD NOT EXERCISED]" },
+                );
+            }
             // Send the assembled VOX2 record (downsampled frame + features).
             let t_send = Instant::now();
             let send_max_ms = match send_record(&mut stream, &p.tx) {
