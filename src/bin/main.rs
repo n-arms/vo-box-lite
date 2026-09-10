@@ -402,7 +402,7 @@ fn map_frame(
         pyramid::FAST_THRESHOLD,
         &mut p.arena,
         &mut p.work,
-        &mut p.vcol,
+        &mut p.vcol[p.vcol_off..],
         &mut p.corners,
         &mut p.scores,
         &mut p.rowidx,
@@ -533,7 +533,11 @@ struct MapPipeline {
     /// Blur destination / downscale h-pass scratch.
     work: Vec<u8>,
     /// Box-blur running column sums (one u16 per column; hot, per output row).
+    /// Over-allocated and sliced at `vcol_off` so the EE SIMD blur gets a
+    /// 16-byte-aligned base (it uses aligned `vld.128`/`vst.128`).
     vcol: Vec<u16>,
+    /// u16 offset of the aligned start inside `vcol`.
+    vcol_off: usize,
     /// Per-level RAW FAST corner scratch (candidates before NMS).
     corners: Vec<fast::Corner>,
     /// Per-corner FAST scores (>= corners.len() i32s).
@@ -560,6 +564,12 @@ impl MapPipeline {
         assert!(w > 0 && h > 0, "camera dims too small to 4x4 downsample");
         let nframe = w * h;
         let nfeat = pyramid::MAX_FEATURES;
+        // Over-allocate vcol so the slice handed to the blur can start on a
+        // 16-byte boundary (align_of::<Vec<u16>>() is only 2); the EE SIMD blur
+        // uses aligned vld.128/vst.128 and falls back to scalar otherwise.
+        let vcol = vec![0u16; w + 8];
+        let vcol_base = vcol.as_ptr() as usize;
+        let vcol_off = ((16 - (vcol_base & 15)) & 15) / 2;
         MapPipeline {
             cam_w,
             cam_h,
@@ -568,7 +578,8 @@ impl MapPipeline {
             frame: vec![0u8; nframe],
             arena: vec![0u8; pyramid::arena_bytes(w, h)],
             work: vec![0u8; nframe],
-            vcol: vec![0u16; w],
+            vcol,
+            vcol_off,
             corners: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
             scores: vec![0i32; pyramid::CORNERS_RAW_MAX],
             rowidx: vec![usize::MAX; h], // one per level-0 row (largest level)

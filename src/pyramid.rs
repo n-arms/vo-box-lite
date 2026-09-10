@@ -22,7 +22,9 @@
 //!    is never read again once that level is processed). >= [`arena_bytes`].
 //!  - `work`: box-blur destination AND downscale h-pass scratch — used at
 //!    different points of each level, never concurrently; >= `w * h` bytes.
-//!  - `vcol`: box-blur running column sums, >= `w` u16 (keep in internal SRAM).
+//!  - `vcol`: box-blur running column sums, >= `w` u16 (keep in internal SRAM);
+//!    the EE SIMD blur uses aligned `vld.128`/`vst.128`, so its base should be
+//!    16-byte aligned (a misaligned slice still blurs correctly, just scalar).
 //! -  `corners`: per-level RAW FAST corner scratch, >= [`CORNERS_RAW_MAX`].
 //! -  `scores` >= corners.len() i32s, `rowidx` >= the level-0 height (usize
 //!    per image row), `nms`: non-max-suppression survivor store.

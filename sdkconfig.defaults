@@ -22,3 +22,11 @@ CONFIG_SPIRAM_SPEED_80M=y
 # CONFIG_LWIP_WND_SCALE). WND is this side's receive window (STRT only).
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 CONFIG_LWIP_TCP_WND_DEFAULT=32768
+
+# The release (-Os/s) IDF C build links the new I2C driver_ng in addition to the
+# legacy driver the esp32-camera SCCB uses; the legacy driver has a startup
+# __attribute__((constructor)) that aborts if driver_ng is linked, so a release
+# image crashloops at boot with "i2c: CONFLICT! driver_ng ..." (the debug C
+# build happened to dead-strip driver_ng). Nothing uses both at runtime -> skip
+# the check (same escape hatch IDF documents for legacy-driver users).
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
