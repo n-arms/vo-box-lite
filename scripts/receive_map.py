@@ -7,6 +7,7 @@ record build map.txt + map_report.txt (match -> COLMAP). --rebuild: no ESP.
 import argparse
 import shutil
 import socket
+import struct
 import sys
 import time
 from pathlib import Path
@@ -238,6 +239,62 @@ def build_from_work(work: Path, args) -> int:
     return 0
 
 
+# COLMAP camera model name -> on-wire id (must match CAMERA_MODEL_* in
+# src/bin/main.rs). Only SIMPLE_RADIAL is produced by colmap_map.py.
+CAMERA_MODEL_IDS = {"SIMPLE_RADIAL": 1}
+
+
+def load_map_txt(path: Path):
+    """Parse map.txt -> (model_id, [f, cx, cy, k1], [(x, y, z, desc_bytes)])."""
+    model_id = params = None
+    points = []
+    with open(path) as f:
+        for line in f:
+            t = line.split()
+            if not t or t[0].startswith("#"):
+                continue
+            if t[0] == "CAMERA":
+                if t[1] not in CAMERA_MODEL_IDS:
+                    raise ValueError(f"unsupported camera model {t[1]!r} in {path}")
+                model_id = CAMERA_MODEL_IDS[t[1]]
+                params = [float(v) for v in t[2:6]]
+                if len(params) != 4:
+                    raise ValueError(f"expected 4 SIMPLE_RADIAL params, got {t[2:]}")
+            elif t[0] == "POINT":
+                desc = bytes.fromhex(t[4])
+                if len(desc) != 32:
+                    raise ValueError(f"descriptor is {len(desc)} B, expected 32")
+                points.append((float(t[1]), float(t[2]), float(t[3]), desc))
+    if model_id is None:
+        raise ValueError(f"no CAMERA line in {path}")
+    if not points:
+        raise ValueError(f"no POINT lines in {path}")
+    return model_id, params, points
+
+
+def upload_map(args, map_path: Path) -> None:
+    """Send the built map (intrinsics + 3D points + descriptors) to the ESP
+    (MAPU) and wait for its MAPK ack. Fresh connection: the run's was dropped."""
+    model_id, params, points = load_map_txt(map_path)
+    body = bytearray(rf.MAGIC_MAPU)
+    body.append(model_id)
+    body += struct.pack("<4f", *params)
+    body += struct.pack("<I", len(points))
+    for (x, y, z, desc) in points:
+        body += struct.pack("<3f", x, y, z) + desc
+    print(f"uploading map: {len(points)} points, camera model {model_id}, "
+          f"params {['%.4g' % p for p in params]}, {len(body) + 4} bytes "
+          f"-> {args.host}:{args.port}")
+    with socket.create_connection((args.host, args.port), timeout=15) as conn:
+        conn.settimeout(60)  # ESP ack after it has read + stored the points
+        conn.sendall(struct.pack("<I", len(body)) + bytes(body))
+        kind, payload = rf.read_record(conn)
+        if kind != "MAPK":
+            raise ConnectionError(f"expected MAPK ack, got {kind}")
+        print(f"map accepted: ESP stored {payload} points — firmware is now in "
+              f"localize mode (idle until the next map run)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -256,6 +313,8 @@ def main() -> int:
                          "default 300 = 5 min)")
     ap.add_argument("--interval", type=int, default=1000,
                     help="ms between streamed frames (0 = max rate; sent in STRT)")
+    ap.add_argument("--no-upload", action="store_true",
+                    help="skip uploading the built map to the ESP")
     args = ap.parse_args()
 
     work = Path(args.work)
@@ -280,7 +339,17 @@ def main() -> int:
     if n < MIN_USABLE_FRAMES:
         print(f"warning: only {n} frame(s) — COLMAP needs overlapping views; "
               f"building anyway")
-    return build_from_work(work, args)
+    rc = build_from_work(work, args)
+    if rc == 0 and not args.no_upload:
+        # Push the built map back to the ESP (it then idles in localize mode).
+        # --rebuild never uploads (that path is for building without an ESP).
+        try:
+            upload_map(args, work / "map.txt")
+        except (OSError, ValueError) as e:
+            print(f"!! map upload failed: {e}", file=sys.stderr)
+            print(f"   map.txt is saved at {work / 'map.txt'}", file=sys.stderr)
+            return 1
+    return rc
 
 
 if __name__ == "__main__":
