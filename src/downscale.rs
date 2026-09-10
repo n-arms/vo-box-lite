@@ -89,6 +89,129 @@ pub const fn downscale_4x4_size(n: usize) -> usize {
     n / 4
 }
 
+/// One 4x4 block mean at output (`y`, `x`) — the scalar reference / tail path.
+#[inline(always)]
+fn block_mean4(src: &[u8], sw: usize, y: usize, x: usize) -> u8 {
+    let p = src.as_ptr();
+    let i = (4 * y).wrapping_mul(sw).wrapping_add(4 * x);
+    let mut s = 0u32;
+    // 16 taps; `wrapping_add` keeps the dev profile's overflow checks out.
+    for dy in 0..4usize {
+        let r = i.wrapping_add(dy.wrapping_mul(sw));
+        unsafe {
+            s += *p.wrapping_add(r) as u32
+                + *p.wrapping_add(r + 1) as u32
+                + *p.wrapping_add(r + 2) as u32
+                + *p.wrapping_add(r + 3) as u32;
+        }
+    }
+    (s >> 4) as u8
+}
+
+/// Broadcast `1` for the EE `vmul.u16` shift below.
+#[cfg(target_arch = "xtensa")]
+static SIMD_ONE16: u16 = 1;
+
+/// Four block means from one 16-column window across rows `4y..4y+4`, packed
+/// little-endian. S3 EE/PIE kernel (blur's unaligned-load pattern); the
+/// caller's `a0`/`a3` bounds check must keep both aligned blocks in `src`.
+#[cfg(target_arch = "xtensa")]
+#[inline(always)]
+fn simd_block4(src: &[u8], sw: usize, y: usize, x: usize) -> u32 {
+    use core::arch::asm;
+    let base = src.as_ptr() as usize;
+    let p0 = base + 4 * y * sw + 4 * x;
+    let p1 = p0 + sw;
+    let p2 = p0 + 2 * sw;
+    let p3 = p0 + 3 * sw;
+    let one = &SIMD_ONE16 as *const u16 as usize;
+    let sar = 4usize; // truncating >>4 via vmul.u16 with multiplier 1
+    let mut w = 0u32;
+    unsafe {
+        asm!(
+            // Row 0 seeds the accumulators: widen u8 -> u16 (q0 low, q1 high).
+            "ee.ld.128.usar.ip q0, {p0}, 16",
+            "ee.vld.128.ip      q4, {p0}, -16",
+            "ee.src.q           q0, q0, q4",
+            "ee.zero.q          q1",
+            "ee.vzip.8          q0, q1",
+            // Rows 1..3: widen into q2/q3 and accumulate (sums <= 4080, s16 exact).
+            "ee.ld.128.usar.ip q2, {p1}, 16",
+            "ee.vld.128.ip      q4, {p1}, -16",
+            "ee.src.q           q2, q2, q4",
+            "ee.zero.q          q3",
+            "ee.vzip.8          q2, q3",
+            "ee.vadds.s16       q0, q0, q2",
+            "ee.vadds.s16       q1, q1, q3",
+            "ee.ld.128.usar.ip q2, {p2}, 16",
+            "ee.vld.128.ip      q4, {p2}, -16",
+            "ee.src.q           q2, q2, q4",
+            "ee.zero.q          q3",
+            "ee.vzip.8          q2, q3",
+            "ee.vadds.s16       q0, q0, q2",
+            "ee.vadds.s16       q1, q1, q3",
+            "ee.ld.128.usar.ip q2, {p3}, 16",
+            "ee.vld.128.ip      q4, {p3}, -16",
+            "ee.src.q           q2, q2, q4",
+            "ee.zero.q          q3",
+            "ee.vzip.8          q2, q3",
+            "ee.vadds.s16       q0, q0, q2",
+            "ee.vadds.s16       q1, q1, q3",
+            // Two unzip+add rounds reduce each group of 4 u16 lanes; the four
+            // block sums land in q0 lanes 0..3.
+            "ee.vunzip.16       q1, q0",
+            "ee.vadds.s16       q0, q0, q1",
+            "ee.vunzip.16       q1, q0",
+            "ee.vadds.s16       q0, q0, q1",
+            // Truncating >>4, then pack the four low bytes.
+            "ee.vldbc.16        q7, {one}",
+            "wsr.sar            {sar}",
+            "ee.vmul.u16        q0, q0, q7",
+            "ee.vunzip.8        q0, q1",
+            "ee.movi.32.a       q0, {w}, 0",
+            p0 = in(reg) p0,
+            p1 = in(reg) p1,
+            p2 = in(reg) p2,
+            p3 = in(reg) p3,
+            one = in(reg) one,
+            sar = in(reg) sar,
+            w = lateout(reg) w,
+            options(nostack, readonly),
+        );
+    }
+    w
+}
+
+/// Host mirror of [`simd_block4`] (same four block means, no asm).
+#[cfg(not(target_arch = "xtensa"))]
+#[inline(always)]
+fn simd_block4(src: &[u8], sw: usize, y: usize, x: usize) -> u32 {
+    let mut b = [0u8; 4];
+    for (k, v) in b.iter_mut().enumerate() {
+        *v = block_mean4(src, sw, y, x + k);
+    }
+    u32::from_le_bytes(b)
+}
+
+/// Four raw byte stores — range indexing / `copy_from_slice` outline to calls
+/// at the dev profile's `opt-level="z"` (see `blur::store8`).
+#[inline(always)]
+fn store4(dst_row: &mut [u8], x: usize, w: u32) {
+    let p = dst_row.as_mut_ptr();
+    unsafe {
+        *p.wrapping_add(x) = w as u8;
+        *p.wrapping_add(x + 1) = (w >> 8) as u8;
+        *p.wrapping_add(x + 2) = (w >> 16) as u8;
+        *p.wrapping_add(x + 3) = (w >> 24) as u8;
+    }
+}
+
+/// One raw byte store for the scalar tail. `x` must be in bounds.
+#[inline(always)]
+fn store1(dst_row: &mut [u8], x: usize, v: u8) {
+    unsafe { *dst_row.as_mut_ptr().wrapping_add(x) = v };
+}
+
 /// INTER_AREA-style 4x4 block mean, `dst = sw/4 x sh/4` (exact-integer-ratio
 /// `INTER_AREA`). Truncating `>>4` (16-u8 sum fits u16) matches a C `s/16`. No
 /// scratch; trailing partial rows/cols unread. False on bad sizes, empty if axis < 4.
@@ -98,33 +221,28 @@ pub fn downscale_4x4(src: &[u8], sw: usize, sh: usize, dst: &mut [u8]) -> bool {
     if sw == 0 || sh == 0 || src.len() < sw * sh || dst.len() < dw * dh {
         return false;
     }
+    let start = src.as_ptr() as usize;
+    let end = start + src.len();
     for y in 0..dh {
-        let y0 = 4 * y;
-        let r0 = &src[y0 * sw..(y0 + 1) * sw];
-        let r1 = &src[(y0 + 1) * sw..(y0 + 2) * sw];
-        let r2 = &src[(y0 + 2) * sw..(y0 + 3) * sw];
-        let r3 = &src[(y0 + 3) * sw..(y0 + 4) * sw];
         let out = &mut dst[y * dw..(y + 1) * dw];
-        for x in 0..dw {
-            let i = 4 * x;
-            // 16 taps, k = 0..3 unrolled per row (compiler folds the offsets).
-            let s = r0[i] as u16
-                + r0[i + 1] as u16
-                + r0[i + 2] as u16
-                + r0[i + 3] as u16
-                + r1[i] as u16
-                + r1[i + 1] as u16
-                + r1[i + 2] as u16
-                + r1[i + 3] as u16
-                + r2[i] as u16
-                + r2[i + 1] as u16
-                + r2[i + 2] as u16
-                + r2[i + 3] as u16
-                + r3[i] as u16
-                + r3[i + 1] as u16
-                + r3[i + 2] as u16
-                + r3[i + 3] as u16;
-            out[x] = (s >> 4) as u8;
+        let row = start.wrapping_add((4 * y).wrapping_mul(sw));
+        // Four outputs per EE block; fall back to scalar at any unsafe edge.
+        let mut x = 0usize;
+        while x + 4 <= dw {
+            let p = row.wrapping_add(4 * x);
+            // The two aligned blocks under the window span `[a0, a3 + 32)`
+            // (addresses are monotonic, so row 0 / row 3 are the extremes).
+            let a0 = p & !15;
+            let a3 = p.wrapping_add(3 * sw) & !15;
+            if a0 < start || a3.wrapping_add(32) > end {
+                break;
+            }
+            store4(out, x, simd_block4(src, sw, y, x));
+            x += 4;
+        }
+        while x < dw {
+            store1(out, x, block_mean4(src, sw, y, x));
+            x += 1;
         }
     }
     true
@@ -362,6 +480,25 @@ mod tests {
                     "size {sw}x{sh} trial {trial}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn area_handles_offset_source_slices() {
+        // Drive the aligned-block bounds predicate from every source byte
+        // offset (edge blocks must fall back to the scalar mean, not over-read).
+        let (sw, sh) = (37, 21);
+        let dw = downscale_4x4_size(sw);
+        let dh = downscale_4x4_size(sh);
+        let n = sw * sh;
+        let mut backing = vec![0u8; n + 32];
+        let mut rng = Lcg(0x0F_F0_0F_F0);
+        rng.fill(&mut backing);
+        for off in 0..16usize {
+            let src = &backing[off..off + n];
+            let mut dst = vec![0u8; dw * dh];
+            assert!(downscale_4x4(src, sw, sh, &mut dst));
+            assert_eq!(dst, naive_downscale_4x4(src, sw, sh), "offset {off}");
         }
     }
 
