@@ -11,13 +11,10 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# receive_frames is stdlib-only; build deps import lazily in build_from_work
+# so the receive phase can also run from a Windows Python.
 import receive_frames as rf  # record parsing + BMP/CSV writers
-import match_features as mf  # numpy Hamming matcher
-import colmap_map            # pycolmap reconstruction glue
-import write_map             # map.txt writer
 
 MIN_FEATURES = 20      # frames with fewer features are dropped before matching
 MIN_USABLE_FRAMES = 3  # below this, COLMAP has no chance — give up gracefully
@@ -93,7 +90,13 @@ def receive_run(args, work: Path) -> None:
 
 def build_from_work(work: Path, args) -> int:
     """Phase 2: match + COLMAP + map.txt + report, from whatever frames are in
-    <work>. Returns process exit code."""
+    <work>. Build deps import here (not at module load) so the receive phase can
+    also run from a Windows Python without them. Returns process exit code."""
+    import numpy as np
+    import match_features as mf  # numpy Hamming matcher
+    import colmap_map            # pycolmap reconstruction glue
+    import write_map             # map.txt writer
+
     bmps, features = work / "bmps", work / "features"
     bmp_files = sorted(bmps.glob("IMG*.bmp"))
     if not bmp_files:

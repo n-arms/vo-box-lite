@@ -16,3 +16,9 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+
+# TCP throughput: the 5760 B lwIP default send buffer (4*MSS) forces a ~200 KB
+# VOX2 record through ~35 blocking writes; 32 KB fixes it (65535 max without
+# CONFIG_LWIP_WND_SCALE). WND is this side's receive window (STRT only).
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
