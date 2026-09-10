@@ -48,10 +48,9 @@ const FMT_GRAYSCALE: u8 = 3;
 const CAM_W: usize = 2048;
 const CAM_H: usize = 1536;
 
-/// Monotonic microsecond clock for the per-frame timing logs (std `Instant`,
-/// backed by esp_timer on the S3). `Instant` has no epoch, so anchor it once
-/// at boot — only deltas matter. A fn pointer (no captures) so it can ride on
-/// the no_std [`pyramid::PyramidProfile`].
+/// Monotonic µs clock for the perf logs (`Instant`/esp_timer, anchored at boot
+/// since only deltas matter). A bare fn pointer so it can ride on the no_std
+/// [`pyramid::PyramidProfile`].
 static BOOT_TIME: OnceLock<Instant> = OnceLock::new();
 fn now_us() -> u64 {
     let boot = *BOOT_TIME.get_or_init(Instant::now);
@@ -348,11 +347,9 @@ fn read_exact_poll(
     Ok(())
 }
 
-/// Per-frame stage timings (µs, on the same clock as the pyramid profile):
-/// `capture` = waiting for + grabbing the camera frame, `downscale` = the 4x4
-/// sensor -> level-0 mean, `build` = assembling the VOX2 record; the pyramid
-/// phase timings ride separately on [`pyramid::PyramidProfile`], and
-/// `send`/`pace` are filled by the caller (feature_server).
+/// Per-frame stage timings (µs, same clock as pyramid): `capture`, `downscale`
+/// (4x4 sensor -> level-0) and `build` (VOX2 assembly); `send`/`pace` come from
+/// the caller, the pyramid phases ride on [`pyramid::PyramidProfile`].
 #[derive(Clone, Copy, Default)]
 struct FrameTimings {
     capture_us: u64,
@@ -362,10 +359,9 @@ struct FrameTimings {
     pace_us: u64,
 }
 
-/// Capture one QXGA frame, 4x4-downsample it into the pipeline's level-0
-/// buffer (the upload payload), run the pyramid over it (filling `prof`'s
-/// per-level phase timers) and assemble the VOX2 record into `p.tx`. Err only
-/// on capture/format surprises (dims changed).
+/// Capture one QXGA frame, 4x4-downsample into level-0 `p.frame`, run the
+/// pyramid (filling `prof`) and assemble the VOX2 record into `p.tx`. Err on
+/// capture/format surprises (dims changed).
 fn map_frame(
     cam: &camera::Camera,
     p: &mut MapPipeline,
@@ -384,10 +380,9 @@ fn map_frame(
     if fb.data().len() != w * h {
         return Err("frame length != w*h (format not grayscale?)");
     }
-    // Full sensor detail is captured at QXGA; the frame the pyramid (and the
-    // laptop) sees is the 4x4 INTER_AREA mean down to level-0 dims. The fb is
-    // read straight from the driver (no full-size copy) and returned right
-    // away so the driver can keep capturing while we process.
+    // Capture is full QXGA; the pyramid/laptop see the 4x4 INTER_AREA mean. The
+    // fb is read straight from the driver and returned right away (no full-size
+    // copy) so it can keep capturing while we process.
     let t_ds = Instant::now();
     if !downscale::downscale_4x4(fb.data(), w, h, &mut p.frame) {
         return Err("downscale_4x4 failed (buffer sizes?)");
@@ -423,14 +418,9 @@ fn map_frame(
 /// corners}. See build_record + receive_frames.py for the byte layout.
 const VOX2_TIMING_FOOTER_BYTES: usize = 3 * 4 + pyramid::LEVELS * (6 * 4 + 2);
 
-/// Assemble one VOX2 record into `buf`: length | magic | fmt | w | h | nfeat
-/// | raw pixels | per-feature {level, x, y, descriptor} | timing footer. The
-/// footer carries this frame's per-phase µs timings (`tm` capture/4x4-
-/// downscale + `prof` pyramid + this function's own assembly time, returned)
-/// on the WiFi stream — the ESP console UART has wedged at WiFi-client
-/// association on every observed run (nothing past the station-join line), so
-/// the profiling rides with the frames instead of the serial log.
-/// Returns the record-assembly time in µs (the footer's build_us field).
+/// Assemble one VOX2 record: length | magic | fmt | w | h | nfeat | pixels |
+/// {level,x,y,desc} per feature | timing footer. Timings ride the WiFi stream
+/// (the console UART wedges at station join); returns the build time in µs.
 fn build_record(
     buf: &mut Vec<u8>,
     w: usize,
@@ -462,10 +452,9 @@ fn build_record(
             buf.extend_from_slice(&word.to_le_bytes());
         }
     }
-    // Footer (after the features). build_us excludes this tiny append;
-    // capture/downscale were timed by map_frame, the pyramid phases by
-    // pyramid::extract_pyramid (all µs on the same clock). Phase order must
-    // match receive_frames.py's VOX2_FOOTER_FMT ("6IH" per level).
+    // Footer (after the features): build_us excludes this append; capture/
+    // downscale came from map_frame, pyramid phases from extract_pyramid. Phase
+    // order must match receive_frames.py's VOX2_FOOTER_FMT ("6IH").
     let build_us = t0.elapsed().as_micros() as u64;
     buf.extend_from_slice(&(tm.capture_us as u32).to_le_bytes());
     buf.extend_from_slice(&(tm.downscale_us as u32).to_le_bytes());
@@ -532,9 +521,8 @@ struct MapPipeline {
     arena: Vec<u8>,
     /// Blur destination / downscale h-pass scratch.
     work: Vec<u8>,
-    /// Box-blur running column sums (one u16 per column; hot, per output row).
-    /// Over-allocated and sliced at `vcol_off` so the EE SIMD blur gets a
-    /// 16-byte-aligned base (it uses aligned `vld.128`/`vst.128`).
+    /// Box-blur running column sums (one u16/col). Over-allocated + sliced at
+    /// `vcol_off` so the EE SIMD blur gets its 16-byte-aligned base.
     vcol: Vec<u16>,
     /// u16 offset of the aligned start inside `vcol`.
     vcol_off: usize,
@@ -564,9 +552,8 @@ impl MapPipeline {
         assert!(w > 0 && h > 0, "camera dims too small to 4x4 downsample");
         let nframe = w * h;
         let nfeat = pyramid::MAX_FEATURES;
-        // Over-allocate vcol so the slice handed to the blur can start on a
-        // 16-byte boundary (align_of::<Vec<u16>>() is only 2); the EE SIMD blur
-        // uses aligned vld.128/vst.128 and falls back to scalar otherwise.
+        // Over-allocate vcol so the blur slice lands on a 16-byte boundary
+        // (align_of::<Vec<u16>>() is 2); misaligned just falls back to scalar.
         let vcol = vec![0u16; w + 8];
         let vcol_base = vcol.as_ptr() as usize;
         let vcol_off = ((16 - (vcol_base & 15)) & 15) / 2;

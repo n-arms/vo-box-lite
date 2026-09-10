@@ -1,34 +1,6 @@
-//! Seven-level scale pyramid — the `map` task's per-frame extractor.
-//!
-//! Mirrors slam-exp's `extract_pyramid()`: level 0 is the source frame and
-//! levels 1..=6 are the previous level downscaled by the fixed 6:5 ratio
-//! (1.2x) with [`downscale::downscale_65`]. Every level runs FAST-12 on the
-//! raw level image, 5x5-box-blurs a copy ([`blur::box_blur5x5`], after FAST,
-//! before description — extract.c order), then computes rBRIEF descriptors on
-//! the blurred copy ([`rbrief::rbrief_descriptor`]); border-band keypoints are
-//! dropped (all-zero descriptors never match). Each kept feature's local
-//! integer keypoint is projected back to level-0 pixels with `x * 1.2^level`,
-//! accumulated exactly like extract.c so descriptors/positions line up with
-//! the COLMAP map built from this stream on the laptop.
-//!
-//! no_std + alloc-free: every buffer is caller-owned (PSRAM on the S3), so the
-//! whole pyramid needs no per-level allocations and the buffers are reused
-//! across frames. The level-0 frame is only ever read — the caller keeps it
-//! pristine as the upload payload.
-//!
-//! Buffer layout (sized from the level-0 dims):
-//!  - `arena`: pixel storage for levels 1..=6, concatenated and written
-//!    strictly forward (each downscale writes the next level's region, which
-//!    is never read again once that level is processed). >= [`arena_bytes`].
-//!  - `work`: box-blur destination AND downscale h-pass scratch — used at
-//!    different points of each level, never concurrently; >= `w * h` bytes.
-//!  - `vcol`: box-blur running column sums, >= `w` u16 (keep in internal SRAM);
-//!    the EE SIMD blur uses aligned `vld.128`/`vst.128`, so its base should be
-//!    16-byte aligned (a misaligned slice still blurs correctly, just scalar).
-//! -  `corners`: per-level RAW FAST corner scratch, >= [`CORNERS_RAW_MAX`].
-//! -  `scores` >= corners.len() i32s, `rowidx` >= the level-0 height (usize
-//!    per image row), `nms`: non-max-suppression survivor store.
-//! -  `out`: feature store, >= [`MAX_FEATURES`].
+//! Seven-level scale pyramid: level 0 = source, 1..6 = 6:5-downscaled. Per level
+//! FAST-12 -> box blur -> rBRIEF (border keypoints dropped); positions project to
+//! level-0 as `x * 1.2^level` in extract.c order. no_std, caller-owned buffers.
 
 use crate::blur::box_blur5x5;
 use crate::downscale::downscale_65;
@@ -40,18 +12,13 @@ use crate::rbrief;
 pub const LEVELS: usize = 7;
 /// Fixed 6:5 pyramid ratio (the downscaler's scale per level).
 pub const SCALE: f32 = 1.2;
-/// FAST corner threshold. Sep 8: 40 -> 20 (smooth webcam scenes gave 0
-/// corners), then 20 -> 10 once the capture moved to QXGA 2048x1536 4x4-down-
-/// sampled to 512x384 (the 4x4 mean blurs texture, so a weaker threshold is
-/// needed to keep corner density up). Keep the future `localize` extractor on
-/// the same value as THIS (map descriptors only match query descriptors
-/// extracted at the same threshold). slam-exp's C pipeline runs 40 on its own
-/// full-res captures — not directly comparable.
+/// FAST threshold. Lowered 40 -> 20 -> 10 as capture moved to QXGA 4x4-down-
+/// sampled VGA (the mean blurs texture). Keep future `localize` extraction on
+/// this value: map descriptors only match queries extracted at the same threshold.
 pub const FAST_THRESHOLD: i32 = 10;
-/// Per-level RAW FAST corner scratch cap. Non-max suppression needs the FULL
-/// raw list to suppress exactly (a truncated list only suppresses its top
-/// rows), so this must comfortably exceed the raw count: 512x384 content at
-/// threshold 10 can yield a few thousand corners on textured scenes.
+/// Raw FAST corner scratch cap. NMS needs the FULL raw list to suppress exactly
+/// (a truncated list only covers its top rows), so this must comfortably exceed
+/// the raw count — a few thousand corners on textured 512x384 scenes.
 pub const CORNERS_RAW_MAX: usize = 8192;
 /// Per-frame feature cap (= the `out` capacity the caller must provide).
 pub const MAX_FEATURES: usize = 4096;
@@ -81,16 +48,9 @@ impl Default for Feature {
     }
 }
 
-/// Optional per-frame phase timings, filled by [`extract_pyramid`] when a
-/// profile is passed (`None` = no profiling: a branch per level, nothing
-/// else). One entry per pyramid level (index 0 = full size); `downscale_us[l]`
-/// covers the 6:5 downscale INTO level l+1 (so index LEVELS-1 is never
-/// written), `corners[l]` is the level's NMS survivor count (the rBRIEF
-/// keypoint workload).
-///
-/// The clock is caller-injected (`now_us`, a monotonic microsecond fn —
-/// `std::time::Instant` based on the S3) so this no_std lib stays portable;
-/// host builds can pass a fake clock.
+/// Optional per-frame timing profile (None = off). `now_us` is a caller-injected
+/// monotonic µs clock so the no_std lib stays portable; `downscale_us[l]` times
+/// the 6:5 into level l+1 (index LEVELS-1 unused), `corners[l]` = NMS survivors.
 #[derive(Debug)]
 pub struct PyramidProfile {
     /// Caller's microsecond clock (see the struct docs).
@@ -154,20 +114,9 @@ pub fn arena_bytes(w: usize, h: usize) -> usize {
     sz
 }
 
-/// Run the full pyramid extraction of the raw level-0 `img` (`w` x `h`) at
-/// FAST threshold `thr`. Returns the number of features written to `out`
-/// (levels in order 0..6, survivors of FAST non-max suppression in scan
-/// order, only rBRIEF-valid ones).
-///
-/// Returns 0 if any buffer is undersized (checked once from the level-0 dims)
-/// or the image has no interior (w/h < 7). Scratch: `corners` holds the raw
-/// FAST candidates for a level (>= [`CORNERS_RAW_MAX`] so full lists are
-/// scored and suppressed exactly), `scores` >= corners.len() i32s, `rowidx`
-/// >= `h` usize (one per image row of the largest level), `nms` is the
-/// survivor store (survivors past its length are dropped).
-///
-/// `profile`: optional per-phase/per-level timers, filled for the levels that
-/// actually ran (skipped levels stay 0). Pass None to skip profiling.
+/// Extract the whole pyramid from raw level-0 `img` (`w` x `h`) at threshold
+/// `thr`; returns the feature count written to `out` (0 if a buffer is undersized
+/// or there is no interior, w/h < 7). `profile`: optional per-level timers.
 pub fn extract_pyramid(
     img: &[u8],
     w: usize,
@@ -242,14 +191,9 @@ pub fn extract_pyramid(
     total
 }
 
-/// FAST-12 (detect -> score -> non-max suppression) + 5x5 blur + rBRIEF on
-/// one level (`src`, `cw` x `ch`). NMS runs on the raw level image before the
-/// blur (blur output = the rBRIEF image only; the raw level image stays
-/// untouched for the downscale that follows). Border-band keypoints are
-/// dropped (all-zero descriptor, never matched). Appends to `out[total..]`
-/// (up to `out.len()`); returns the number appended. When `profile` is Some,
-/// the per-phase timers for this level are filled (fast/score/nms/blur/
-/// rbrief; the inter-level downscale is timed by extract_pyramid).
+/// FAST-12 (detect -> score -> NMS) + 5x5 blur + rBRIEF on one level (`src`,
+/// `cw` x `ch`). NMS runs on the raw image (the blur feeds rBRIEF only). Appends
+/// to `out[total..]`, returns the count; `profile` fills this level's timers.
 #[allow(clippy::too_many_arguments)]
 fn process_level(
     src: &[u8],
@@ -269,15 +213,9 @@ fn process_level(
     mut profile: Option<&mut PyramidProfile>,
 ) -> usize {
     let li = level as usize;
-    // Detect -> score -> non-max suppression, timed per phase when a profile
-    // is attached. The three calls are exactly what fast::fast12_detect_nonmax
-    // does (fast.rs's `detect_nonmax_wrapper_matches_manual` test guards the
-    // equivalence); they are split here only so each phase can be timed — keep
-    // in sync with that wrapper. The pyramid preconditions keep the scratch
-    // sized, so no level is ever truncated/starved by this composition.
-    // FAST detect runs the SIMD EE variant (fast::ee) -- same corner set as
-    // scalar (host-verified), level dims/thr inside its domain; score/NMS
-    // stay scalar so the per-phase profile is unchanged.
+    // These three calls are exactly fast::fast12_detect_nonmax, split only for
+    // per-phase timing (fast.rs's wrapper test guards the equivalence). Detect
+    // is the EE SIMD variant; score/NMS stay scalar.
     let mut t0 = 0u64; // phase start on the profile clock (0 = not profiling)
     if let Some(pr) = profile.as_deref_mut() {
         t0 = (pr.now_us)();

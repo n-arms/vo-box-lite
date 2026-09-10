@@ -22,10 +22,9 @@ opt-level = "s"
 debug = true    # Symbols are nice, and they don't increase the size on Flash
 opt-level = "z"
 
-# Optimize only our crate in the dev profile (deps keep their cached debug
-# artifacts, incl. the esp-idf-sys C build that boots). opt-level="z" + debug
-# assertions outlined hot-loop code (`copy_from_slice`, `ptr::add` checks) into
-# per-iteration calls, which made the EE SIMD blur perf-neutral.
+# Optimize our crate in the dev profile (deps keep their cached debug artifacts).
+# opt-level="z" + debug assertions outlined hot-loop code into per-iteration
+# calls, which made the EE SIMD blur perf-neutral.
 [profile.dev.package.vo-box-lite]
 opt-level = 3
 debug-assertions = false

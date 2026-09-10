@@ -32,11 +32,9 @@ echo "== vo-box: flash + console (Windows COM port) =="
 powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.Name -like 'python*' -and \$_.CommandLine -like '*serial_monitor.py*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" >/dev/null 2>&1 || true
 
 # --- 0b) refuse to run while a previous espflash is wedged ------------------
-# A `D`-state espflash is parked in usb_kill_urb (the usbipd/vhci wedge
-# documented in AGENTS.md): it pins the ttyACM node, so a new espflash just
-# queues in tty_lock_interruptible and the run hangs at "Connecting...".
-# Signals can't clear it -- the USB device has to go away (replug or
-# `wsl --shutdown`). Abort with a clear message instead of hanging.
+# A D-state espflash parks in usb_kill_urb and pins the ttyACM node, so a new
+# run just hangs at "Connecting..." (signals can't clear it: replug / `wsl
+# --shutdown`). Abort clearly instead of hanging.
 if ps -eo stat=,cmd= | awk '$1 ~ /^D/ && /espflash/ {f=1} END {exit !f}'; then
     echo "ERROR: a previous espflash is stuck in D state (usbipd/vhci wedge):" >&2
     ps -eo pid,stat,etimes,wchan:20,cmd | grep '[e]spflash' >&2 || true

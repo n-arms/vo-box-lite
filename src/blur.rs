@@ -1,24 +1,6 @@
-//! 5x5 box blur over contiguous grayscale frames (u8, row-major): separable
-//! (vertical running column sums + horizontal 5-tap), clamped borders,
-//! no_std + alloc-free. `scratch` = one u16 row of `width` (1280 B at VGA —
-//! keep in internal SRAM).
-//!
-//! The two O(pixels) phases are vectorized with the ESP32-S3 EE/PIE SIMD
-//! extension (inline asm, same construction as [`crate::fast`]'s `ee` module):
-//!
-//!  * [`vcol_advance`] — 16 columns/iteration: unaligned-load two source rows,
-//!    widen u8 -> u16 with `ee.vzip.8` (against a zero register), then add/sub
-//!    the running column sums with `ee.vadds/vsubs.s16`.
-//!  * [`out_row_from_vcol`] — 8 outputs/iteration: build the five shifted
-//!    `vcol` windows for the 5-tap sum from two aligned loads with
-//!    `ee.srci.2q`, accumulate, then divide by 25 with one `ee.vmul.u16`
-//!    (`((s + 12) * 41944) >> 20`, exact round-half-up for every reachable
-//!    sum); the 8 bytes are packed with `ee.vunzip.8`.
-//!
-//! Host builds (`rustc --test`) and a `scratch` that is not 16-byte aligned
-//! fall back to an exactly equivalent scalar/mirror path, so the output is
-//! bit-identical in every case (the EE and scalar forms differ only in how the
-//! same exact integer arithmetic is arranged).
+//! 5x5 box blur over contiguous grayscale frames (u8, row-major): separable,
+//! clamped borders, no_std + alloc-free; the two O(pixels) phases are S3 EE/PIE
+//! SIMD (host mirrors are bit-identical). `scratch` = one aligned u16 row.
 
 /// Full kernel width/height (always 5).
 const WINDOW: usize = 5;
@@ -32,12 +14,9 @@ fn div25(s: u16) -> u8 {
     ((s as u32 * 41943 + (1 << 19)) >> 20) as u8
 }
 
-/// The SIMD divide: `((s + 12) * 41944) >> 20` is exactly `round-half-up(s/25)`
-/// for every reachable 5x5 sum `s <= 6375` (exhaustively verified in tests).
-/// `ee.vmul.u16` computes the full 32-bit product, shifts it right by SAR and
-/// keeps the low 16 bits, so `vldbc.16` + `wsr.sar` + `vmul.u16` divides 8 u16
-/// lanes in one shot. Plain-Rust mirror + host tests; the statics must live in
-/// memory because `ee.vldbc.16` loads the broadcast value from an address.
+/// Mirror of the EE `/25`: `((s + 12) * 41944) >> 20` == round-half-up `s/25`
+/// for every reachable sum (exhaustively tested). One `vmul.u16` divides 8
+/// lanes; the constants live in statics so `vldbc.16` can broadcast from memory.
 #[inline(always)]
 #[cfg_attr(target_arch = "xtensa", allow(dead_code))]
 fn div25_simd(s: u16) -> u8 {
@@ -96,11 +75,8 @@ fn vcol_init(src: &[u8], w: usize, vcol: &mut [u16]) {
 // are written literally, as in `fast::ee`: LLVM only names the 8 EE registers,
 // and normal Rust codegen never uses them, so they need no clobber list).
 
-/// Write the 8 output bytes of a SIMD block directly (no `copy_from_slice`):
-/// at `opt-level="z"` that call is outlined to `index_mut` +
-/// `copy_from_slice_impl`, which dominated the loop. Unrolled raw stores keep
-/// it to plain `s8i` (the `bytes` array + loop let LLVM call `memcpy` instead).
-/// `x + 8` must be in bounds (caller guarantees `x + 7 <= w - 3`).
+/// Unrolled 8-byte store (slices/`copy_from_slice` outline to calls at
+/// `opt-level="z"` and erase the SIMD win). `x + 8` must be in bounds.
 #[inline(always)]
 fn store8(dst_row: &mut [u8], x: usize, words: [u32; 2]) {
     let p = dst_row.as_mut_ptr();
@@ -116,12 +92,8 @@ fn store8(dst_row: &mut [u8], x: usize, words: [u32; 2]) {
     }
 }
 
-/// One 8-output horizontal block (outputs `x..x+8` of an interior row):
-/// `sum[i] = v[i-2]+v[i-1]+v[i]+v[i+1]+v[i+2]` over `vcol`, divided by 25 and
-/// packed into two little-endian u32 words.
-///
-/// Preconditions (asserted by the caller): `vcol` 16-byte aligned,
-/// `2 <= x`, `x + 14 <= vcol.len()`, `x ≡ 2 (mod 8)` (so both loads align).
+/// One 8-output interior block: `sum[i] = vcol[x-2+i..=x+2+i]`, `/25`, packed
+/// little-endian. Requires 16-byte-aligned `vcol`, `2 <= x`, `x + 14 <= len`.
 #[cfg(target_arch = "xtensa")]
 #[inline(always)]
 fn simd_out_block8(vcol: &[u16], x: usize) -> [u32; 2] {
@@ -191,10 +163,8 @@ fn simd_out_block8(vcol: &[u16], x: usize) -> [u32; 2] {
     ]
 }
 
-/// One 16-column vertical block: `vcol[x+i] += add[x+i] - drop[x+i]` for `i`
-/// in `0..16`. `add`/`drop` are the source rows (any alignment);
-/// `&vcol[x..x+16]` must be 16-byte aligned. Taking the full slices + offset
-/// (rather than `&mut vcol[x..x+16]`) keeps `index_mut` out of the loop.
+/// One 16-column vertical block: `vcol[x+i] += add[x+i] - drop[x+i]`, `i` in
+/// `0..16`. Full slices + `x` (not `&mut vcol[x..x+16]`) keep `index_mut` out.
 #[cfg(target_arch = "xtensa")]
 #[inline(always)]
 fn simd_vcol_block16(vcol: &mut [u16], x: usize, add: &[u8], drop: &[u8]) {
@@ -205,16 +175,14 @@ fn simd_vcol_block16(vcol: &mut [u16], x: usize, add: &[u8], drop: &[u8]) {
     let vh = vl + 16;
     unsafe {
         asm!(
-            // Unaligned 16-byte window of each source row: aligned block +
-            // `src.q` selects [ptr, ptr+16) using the SAR set by `usar`.
+            // Unaligned 16-byte window per row: aligned block + `src.q`.
             "ee.ld.128.usar.ip q1, {ap}, 16",
             "ee.vld.128.ip      q7, {ap}, -16",
             "ee.src.q           q1, q1, q7",
             "ee.ld.128.usar.ip q4, {dp}, 16",
             "ee.vld.128.ip      q7, {dp}, -16",
             "ee.src.q           q4, q4, q7",
-            // Widen 16 x u8 -> 16 x u16 with a zero register (vzip.8 with a
-            // zero operand interleaves the byte lanes into u16 lanes).
+            // `vzip.8` against zero widens u8 -> u16.
             "ee.zero.q          q0",
             "ee.vzip.8          q1, q0",     // q1 = add[0..8] (u16), q0 = add[8..16]
             "ee.zero.q          q7",
@@ -237,9 +205,8 @@ fn simd_vcol_block16(vcol: &mut [u16], x: usize, add: &[u8], drop: &[u8]) {
     }
 }
 
-/// Host mirror of [`simd_vcol_block16`]. `vadds`/`vsubs.s16` cannot saturate
-/// here (sums <= 1275, and `vcol` always still contains the dropped row), so
-/// wrapping u16 arithmetic is exact.
+/// Host mirror of [`simd_vcol_block16`] (exact: sums stay in 0..=1275 and
+/// `vcol` still holds the dropped row, so wrapping u16 is safe).
 #[cfg(not(target_arch = "xtensa"))]
 #[inline(always)]
 fn simd_vcol_block16(vcol: &mut [u16], x: usize, add: &[u8], drop: &[u8]) {
@@ -250,35 +217,23 @@ fn simd_vcol_block16(vcol: &mut [u16], x: usize, add: &[u8], drop: &[u8]) {
     }
 }
 
-/// Whether the EE path is usable for a `vcol` with this base pointer. The EE
-/// kernel needs the 16-byte-aligned `vld`/`vst`; host builds can ignore it
-/// (the mirror has no alignment requirement).
+/// The EE kernel needs a 16-byte-aligned `vcol` (`vld`/`vst`); host mirrors
+/// don't care, so they always take the vector path.
 #[inline(always)]
 fn simd_aligned(vcol: *const u16) -> bool {
-    #[cfg(target_arch = "xtensa")]
-    {
-        (vcol as usize) & 15 == 0
-    }
-    #[cfg(not(target_arch = "xtensa"))]
-    {
-        let _ = vcol;
-        true
-    }
+    !cfg!(target_arch = "xtensa") || (vcol as usize) & 15 == 0
 }
 
-/// Slide the vertical window down one row: drop source row `drop`, add
-/// source row `add`. Column sums never leave `0..=1275`, so plain u16
-/// arithmetic cannot overflow. EE path in 16-column blocks, scalar tail.
+/// Slide the vertical window one row: `vcol += src[add] - src[drop]`, 16 cols
+/// per EE block. Column sums stay in `0..=1275`, so u16 arithmetic is exact.
 fn vcol_advance(src: &[u8], w: usize, drop: usize, add: usize, vcol: &mut [u16]) {
     let a = &src[drop * w..(drop + 1) * w];
     let b = &src[add * w..(add + 1) * w];
     let mut x = 0usize;
     if simd_aligned(vcol.as_ptr()) {
         while x + 16 <= w {
-            // The EE load reads the two 16-byte aligned blocks covering the
-            // source window: the first can start up to 15 bytes before it and
-            // the second up to 15 bytes past it. Skip the block if either
-            // leaves `src` (first row / last row only).
+            // The two aligned blocks under the source window reach up to 15 B
+            // outside it; bow out to scalar on the first/last rows.
             #[cfg(target_arch = "xtensa")]
             {
                 let start = src.as_ptr() as usize;
@@ -303,16 +258,14 @@ fn vcol_advance(src: &[u8], w: usize, drop: usize, add: usize, vcol: &mut [u16])
     }
 }
 
-/// Horizontal 5-tap sum over the column sums `vcol` -> one output row. Ends
-/// are clamped (scalar); the interior runs the EE 8-output blocks.
+/// Horizontal 5-tap over `vcol` -> one output row (clamped ends, EE interior).
 /// Requires `w >= 5`.
 fn out_row_from_vcol(vcol: &[u16], w: usize, dst_row: &mut [u8]) {
     let v = vcol;
     // x = 0, 1: windows (0,0,0,1,2) and (0,0,1,2,3).
     dst_row[0] = div25(3 * v[0] + v[1] + v[2]);
     dst_row[1] = div25(2 * v[0] + v[1] + v[2] + v[3]);
-    // Interior: EE blocks while a full block plus its trailing context is
-    // available, scalar for the remainder.
+    // Interior: EE blocks while a full block + trailing context fits.
     let mut x = 2usize;
     if simd_aligned(vcol.as_ptr()) {
         while x + 14 <= w {
@@ -336,10 +289,8 @@ fn out_row_from_vcol(vcol: &[u16], w: usize, dst_row: &mut [u8]) {
     dst_row[w - 1] = div25(v[w - 3] + v[w - 2] + 3 * v[w - 1]);
 }
 
-/// 5x5 box blur (clamp borders), grayscale `src` -> `dst` (w*h bytes each;
-/// src = camera PSRAM fb, dst = second PSRAM buffer). `scratch` >= width u16
-/// (for the EE path, also 16-byte aligned). False on invalid sizes; success
-/// fills `dst[..w*h]`.
+/// 5x5 box blur (clamped borders), `src` -> `dst` (w*h bytes each). `scratch`
+/// >= width u16, 16-byte aligned. False on invalid sizes.
 pub fn box_blur5x5(
     src: &[u8],
     dst: &mut [u8],
@@ -450,18 +401,14 @@ mod tests {
                 }
                 let mut x = 2usize;
                 while x + 14 <= w {
-                    let words = simd_out_block8(&vcol, x);
-                    let bytes: Vec<u8> = words
-                        .iter()
-                        .flat_map(|word| word.to_le_bytes())
-                        .collect();
+                    let bytes = simd_out_block8(&vcol, x).map(u32::to_le_bytes);
                     for i in 0..8 {
                         let s = vcol[x - 2 + i] as u32
                             + vcol[x - 1 + i] as u32
                             + vcol[x + i] as u32
                             + vcol[x + 1 + i] as u32
                             + vcol[x + 2 + i] as u32;
-                        assert_eq!(bytes[i], div25(s as u16), "w={w} x={x} i={i}");
+                        assert_eq!(bytes[i / 4][i % 4], div25(s as u16), "w={w} x={x} i={i}");
                     }
                     x += 8;
                 }
