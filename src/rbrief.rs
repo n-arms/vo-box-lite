@@ -343,27 +343,31 @@ fn pattern_pair(idx: usize) -> (i32, i32, i32, i32) {
     )
 }
 
-/// rBRIEF at integer (x, y) in the row-major w x h image (stride == w), which
-/// must be the 5x5-box-blurred frame (blur.rs). False + zeroed desc for
-/// border-band keypoints; callers never match all-zero descriptors.
-pub fn rbrief_descriptor(
-    im: &[u8],
-    w: usize,
-    h: usize,
-    x: usize,
-    y: usize,
-    desc: &mut Descriptor,
-) -> bool {
-    *desc = [0; 8];
+/// Border-checked rBRIEF orientation at (x, y) in the w x h image (stride == w);
+/// None in the border band (all-zero descriptor, never matched).
+pub fn rbrief_angle(im: &[u8], w: usize, h: usize, x: usize, y: usize) -> Option<(f32, f32)> {
     let ok = x >= HALF_BOUNDARY
         && y >= HALF_BOUNDARY
         && x + HALF_BOUNDARY < w
         && y + HALF_BOUNDARY < h;
     if !ok {
-        return false;
+        return None;
     }
     debug_assert!(im.len() >= w * h, "image smaller than w*h");
-    let (sin_theta, cos_theta) = ic_angle(im, w, y * w + x);
+    Some(ic_angle(im, w, y * w + x))
+}
+
+/// 256-pair rotated sampling for an orientation from [`rbrief_angle`]. Writes
+/// all 8 words of `desc`.
+pub fn rbrief_samples(
+    im: &[u8],
+    w: usize,
+    x: usize,
+    y: usize,
+    sin_theta: f32,
+    cos_theta: f32,
+    desc: &mut Descriptor,
+) {
     // Rotate a pattern offset by theta (image frame, y-down), translate to
     // the keypoint; round half-even.
     let rot = |dx: i32, dy: i32| {
@@ -386,6 +390,24 @@ pub fn rbrief_descriptor(
         }
         *word = d;
     }
+}
+
+/// rBRIEF at (x, y) over the 5x5-box-blurred image (blur.rs); false + zeroed
+/// desc in the border band. == [`rbrief_angle`] + [`rbrief_samples`] composed.
+pub fn rbrief_descriptor(
+    im: &[u8],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    desc: &mut Descriptor,
+) -> bool {
+    *desc = [0; 8];
+    let (sin_theta, cos_theta) = match rbrief_angle(im, w, h, x, y) {
+        Some(a) => a,
+        None => return false,
+    };
+    rbrief_samples(im, w, x, y, sin_theta, cos_theta, desc);
     true
 }
 

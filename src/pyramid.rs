@@ -103,6 +103,10 @@ pub struct PyramidProfile {
     pub blur_us: [u64; LEVELS],
     /// rBRIEF description per level (over the NMS survivors).
     pub rbrief_us: [u64; LEVELS],
+    /// rBRIEF orientation (IC_Angle) cycles per level (CCOUNT @ 160 MHz).
+    pub rbrief_angle_cyc: [u64; LEVELS],
+    /// rBRIEF 256-pair sampling cycles per level (CCOUNT @ 160 MHz).
+    pub rbrief_sample_cyc: [u64; LEVELS],
     /// 6:5 downscale into the next level (index LEVELS-1 unused).
     pub downscale_us: [u64; LEVELS],
     /// NMS survivors per level.
@@ -118,6 +122,8 @@ impl PyramidProfile {
             nms_us: [0; LEVELS],
             blur_us: [0; LEVELS],
             rbrief_us: [0; LEVELS],
+            rbrief_angle_cyc: [0; LEVELS],
+            rbrief_sample_cyc: [0; LEVELS],
             downscale_us: [0; LEVELS],
             corners: [0; LEVELS],
         }
@@ -304,13 +310,30 @@ fn process_level(
     }
     let mut added = 0;
     let n = n.min(nms.len());
+    // Split rBRIEF into orientation + sampling and time each per keypoint with
+    // the CCOUNT cycle counter (host builds return 0, so the timers stay 0).
+    let mut angle_cyc = 0u64;
+    let mut sample_cyc = 0u64;
     for i in 0..n {
         if total + added >= out.len() {
             break;
         }
         let kp = nms[i];
         let mut desc = [0u32; 8];
-        if rbrief::rbrief_descriptor(work, cw, ch, kp.x, kp.y, &mut desc) {
+        let c0 = ccount();
+        let ang = rbrief::rbrief_angle(work, cw, ch, kp.x, kp.y);
+        let c1 = ccount();
+        let ok = match ang {
+            Some((s, c)) => {
+                rbrief::rbrief_samples(work, cw, kp.x, kp.y, s, c, &mut desc);
+                true
+            }
+            None => false,
+        };
+        let c2 = ccount();
+        angle_cyc += c1.wrapping_sub(c0);
+        sample_cyc += c2.wrapping_sub(c1);
+        if ok {
             out[total + added] = Feature {
                 level,
                 x: kp.x as f32 * scale,
@@ -323,6 +346,25 @@ fn process_level(
     if let Some(pr) = profile.as_deref_mut() {
         pr.rbrief_us[li] = (pr.now_us)() - t0;
         pr.corners[li] = n; // rBRIEF attempts == NMS survivors this level
+        pr.rbrief_angle_cyc[li] = angle_cyc;
+        pr.rbrief_sample_cyc[li] = sample_cyc;
     }
     added
+}
+
+/// Xtensa CCOUNT cycle counter (rsr.ccount, 1 instruction) for the rBRIEF
+/// phase timers; runs at the CPU clock (160 MHz), host builds return 0.
+#[cfg(target_arch = "xtensa")]
+fn ccount() -> u64 {
+    let c: u32;
+    // SAFETY: rsr has no side effects beyond writing the output register.
+    unsafe {
+        core::arch::asm!("rsr.ccount {0}", out(reg) c, options(nomem, nostack));
+    }
+    c as u64
+}
+
+#[cfg(not(target_arch = "xtensa"))]
+fn ccount() -> u64 {
+    0
 }

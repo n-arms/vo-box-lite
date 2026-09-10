@@ -138,6 +138,10 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
             }
         };
         log::info!("laptop connected: {peer} — waiting for its STRT command");
+        // Disable Nagle (pairs with the enlarged lwIP send buffer in sdkconfig).
+        if let Err(e) = stream.set_nodelay(true) {
+            log::warn!("set_nodelay failed ({e})");
+        }
         if pipe.is_none() {
             pipe = Some(MapPipeline::new(CAM_W, CAM_H));
         }
@@ -192,10 +196,13 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
             };
             // Send the assembled VOX2 record (downsampled frame + features).
             let t_send = Instant::now();
-            if send_record(&mut stream, &p.tx).is_err() {
-                interrupted = true;
-                break;
-            }
+            let send_max_ms = match send_record(&mut stream, &p.tx) {
+                Ok(v) => v,
+                Err(_) => {
+                    interrupted = true;
+                    break;
+                }
+            };
             tm.send_us = t_send.elapsed().as_micros() as u64;
             sent += 1;
             feats_sent += p.last_n as u64;
@@ -216,19 +223,23 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                 let p_nms = prof.nms_us.iter().sum::<u64>();
                 let p_blur = prof.blur_us.iter().sum::<u64>();
                 let p_rbrief = prof.rbrief_us.iter().sum::<u64>();
+                // rBRIEF phase split (CCOUNT cycles -> us at the 160 MHz clock).
+                let p_ang = prof.rbrief_angle_cyc.iter().sum::<u64>() / 160;
+                let p_smp = prof.rbrief_sample_cyc.iter().sum::<u64>() / 160;
                 let p_ds = prof.downscale_us.iter().sum::<u64>();
                 let p_pyr = p_fast + p_score + p_nms + p_blur + p_rbrief + p_ds;
                 let total_us = frame_start.elapsed().as_micros() as u64;
                 log::info!(
                     "frame {sent} @ {}s: {} feats — total {total_us} us | capture {} | ds4 {} | \
                      pyramid {p_pyr} (fast {p_fast} + score {p_score} + nms {p_nms} + blur {p_blur} \
-                     + rbrief {p_rbrief} + ds65 {p_ds}) | build {} | send {} | pace {}",
+                     + rbrief {p_rbrief} [angle {p_ang} + sample {p_smp}] + ds65 {p_ds}) | build {} | send {} (max {}ms) | pace {}",
                     run_start.elapsed().as_secs(),
                     p.last_n,
                     tm.capture_us,
                     tm.downscale_us,
                     tm.build_us,
                     tm.send_us,
+                    send_max_ms,
                     tm.pace_us,
                 );
                 // Per-level pyramid cost (all phases summed) + survivors.
@@ -484,8 +495,24 @@ fn build_done_record(buf: &mut Vec<u8>, frames: u64, features: u64) {
     buf.extend_from_slice(&(features as u32).to_le_bytes());
 }
 
-fn send_record(stream: &mut TcpStream, record: &[u8]) -> std::io::Result<()> {
-    stream.write_all(record)
+/// Write `record`, returning the longest single write() stall in ms (a
+/// multi-second stall = TCP retransmit, not bandwidth).
+fn send_record(stream: &mut TcpStream, record: &[u8]) -> std::io::Result<u64> {
+    let mut off = 0usize;
+    let mut max_ms = 0u64;
+    while off < record.len() {
+        let t0 = Instant::now();
+        let n = stream.write(&record[off..])?;
+        max_ms = max_ms.max(t0.elapsed().as_millis() as u64);
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write returned 0",
+            ));
+        }
+        off += n;
+    }
+    Ok(max_ms)
 }
 
 /// Frame-recycled buffers for the feature stream. Sizes are derived from the
