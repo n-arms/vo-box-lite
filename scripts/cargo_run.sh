@@ -66,6 +66,34 @@ echo "port: $port"
 # --- 2) flash ---------------------------------------------------------------
 espflash flash --port "$port" "$ELF" || { echo "ERROR: flash failed" >&2; exit 1; }
 
+# --- 2a) custom partition table ---------------------------------------------
+# `espflash flash <ELF>` has no partition table to go on, so it writes its
+# built-in single-app table (no `model` row). It can't parse ours either:
+# esp-idf-part 0.6.0 panics on the numeric `data` subtype 0x40 (both CSV and
+# binary). The build copies the correct IDF-built binary table next to the ELF,
+# and `write-bin` doesn't parse it, so overwrite what espflash just wrote.
+PT_BIN="$(dirname "$ELF")/partition-table.bin"
+if [ -f "$PT_BIN" ]; then
+    echo "writing custom partition table -> 0x8000..."
+    espflash write-bin --port "$port" 0x8000 "$PT_BIN" || { echo "ERROR: partition table write failed" >&2; exit 1; }
+else
+    echo "ERROR: $PT_BIN not found; the 'model' partition will be missing" >&2
+fi
+
+# --- 2b) flash the semantic model blob (int8 yolov8n) to its partition ------
+# Offset must match the `model` row in partitions.csv. Build the blob with
+# scripts/export_tflite.py. Absent -> the semantic task idles (logs an error).
+MODEL_OFFSET="${MODEL_OFFSET:-0x400000}"
+MODEL_TFLITE="${MODEL_TFLITE:-models/yolov8n.tflite}"
+if [ -f "$MODEL_TFLITE" ]; then
+    echo "writing $MODEL_TFLITE -> $MODEL_OFFSET (model partition)..."
+    if ! espflash write-bin --port "$port" "$MODEL_OFFSET" "$MODEL_TFLITE"; then
+        echo "WARNING: model write failed; the semantic task will idle" >&2
+    fi
+else
+    echo "note: $MODEL_TFLITE not found — run scripts/export_tflite.py (semantic task will idle)"
+fi
+
 # --- 3) detach usbipd so the COM port is free on the Windows side ----------
 echo "Detaching usbipd so COM5 is readable on Windows..."
 powershell.exe -NoProfile -Command "usbipd detach --busid $USBIPD_BUSID" || true

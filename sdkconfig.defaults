@@ -27,3 +27,9 @@ CONFIG_LWIP_TCP_WND_DEFAULT=32768
 # esp32-camera's SCCB uses, and the legacy driver aborts at boot if driver_ng is
 # linked ("i2c: CONFLICT! ..."). Nothing uses both -> skip the check.
 CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# 8 MB flash (ESP32-S3-WROOM N8R8/N16R8). The custom table (partitions.csv)
+# reserves a 4 MB `model` partition for the int8 TFLite yolov8n blob.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

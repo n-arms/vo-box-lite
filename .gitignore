@@ -32,3 +32,8 @@
 /map_run/
 /out.log
 /crashlog
+
+# Semantic task: onnx2tf venv + generated model artifacts (large binaries)
+/scripts/.tflite-venv/
+/models/
+/calibration_image_sample_data_*.npy

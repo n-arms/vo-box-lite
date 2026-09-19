@@ -14,6 +14,12 @@ MCU = "esp32s3"
 ESP_IDF_VERSION = "v5.5.3"
 ESP_IDF_TOOLS_INSTALL_DIR = "workspace"
 
+# IDF's partition_table component resolves CONFIG_PARTITION_TABLE_CUSTOM_FILENAME
+# relative to the generated C project (esp-idf-sys's out dir), so glob-copy our
+# custom table there.
+ESP_IDF_GLOB_BASE = { value = ".", relative = true }
+ESP_IDF_GLOB_PARTITIONS = "partitions.csv"
+
 # Uncomment this if you have moved the target dir by setting CARGO_TARGET_DIR or similar.
 # Required for now due to embuild limitations.
 #CARGO_WORKSPACE_DIR = { value = "", relative = true }

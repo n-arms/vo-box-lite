@@ -39,6 +39,7 @@ esp-idf-hal = "0.46.2"
 esp-idf-sys = "0.37.2"
 # Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+esp_nn_sys = { version = "0.2.1", features = ["esp32s3"] }
 
 [build-dependencies]
 embuild = "0.33"
@@ -53,4 +54,11 @@ extra_components = [
     { remote_component = { name = "espressif/esp32-camera", version = "2.1.7" },
       bindings_header = "esp32_camera_bindings.h",
       bindings_module = "camera" },
+    # esp-tflite-micro runs the int8 yolov8n model (it pulls esp-nn as its
+    # optimized kernel backend). components/semantic is a local C shim over the
+    # C++ MicroInterpreter API; bindgen exposes it as esp_idf_sys::tflite.
+    { component_dirs = ["components/semantic"],
+      remote_component = { name = "espressif/esp-tflite-micro", version = "1.4.1" },
+      bindings_header = "components/semantic/tflite_shim.h",
+      bindings_module = "tflite" },
 ]

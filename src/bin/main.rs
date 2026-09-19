@@ -2,8 +2,14 @@
 //! frames, ends with VOXD) or MAPU (upload a built map + intrinsics; MCU stores
 //! it and idles in localize mode). See scripts/receive_map.py for the protocol.
 
+// The old map/localize entry point is kept but unused while the semantic task
+// (src/semantic.rs) is the startup task.
+#![allow(dead_code)]
+
 #[path = "../camera.rs"]
 mod camera;
+#[path = "../semantic.rs"]
+mod semantic;
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -67,7 +73,17 @@ fn now_us() -> u64 {
     Instant::now().duration_since(boot).as_micros() as u64
 }
 
-fn main() -> Result<(), EspError> {
+/// Entry point: always run the semantic task for now (src/semantic.rs).
+fn main() {
+    esp_idf_svc::sys::link_patches();
+    esp_idf_svc::log::EspLogger::initialize_default();
+    semantic::run();
+}
+
+/// Previous entry point (SoftAP + feature stream / map upload). Kept intact but
+/// unused while the semantic task is brought up.
+#[allow(dead_code)]
+fn map_mode() -> Result<(), EspError> {
     // Required once: links the esp-idf runtime patches (esp-idf-template#71).
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
