@@ -287,7 +287,7 @@ fn simd_block4(src: &[u8], sw: usize, y: usize, x: usize) -> u32 {
     let p3 = p0 + 3 * sw;
     let one = &SIMD_ONE16 as *const u16 as usize;
     let sar = 4usize; // truncating >>4 via vmul.u16 with multiplier 1
-    let mut w = 0u32;
+    let (mut b0, mut b1, mut b2, mut b3) = (0u32, 0u32, 0u32, 0u32);
     unsafe {
         asm!(
             // Row 0 seeds the accumulators: widen u8 -> u16 (q0 low, q1 high).
@@ -318,28 +318,53 @@ fn simd_block4(src: &[u8], sw: usize, y: usize, x: usize) -> u32 {
             "ee.vzip.8          q2, q3",
             "ee.vadds.s16       q0, q0, q2",
             "ee.vadds.s16       q1, q1, q3",
-            // Two unzip+add rounds reduce each group of 4 u16 lanes; the four
-            // block sums land in q0 lanes 0..3.
-            "ee.vunzip.16       q1, q0",
-            "ee.vadds.s16       q0, q0, q1",
-            "ee.vunzip.16       q1, q0",
-            "ee.vadds.s16       q0, q0, q1",
-            // Truncating >>4, then pack the four low bytes.
-            "ee.vldbc.16        q7, {one}",
-            "wsr.sar            {sar}",
-            "ee.vmul.u16        q0, q0, q7",
-            "ee.vunzip.8        q0, q1",
-            "ee.movi.32.a       q0, {w}, 0",
+            // Reduce each group of 4 u16 lanes to its sum, using blur's proven
+            // idiom: repeatedly 1-element-shift the pair and add the LOW output
+            // only (srci.2q imm is in u16 elements, not bytes).
+            "ee.orq            q2, q1, q1",
+            "ee.orq            q3, q0, q0",
+            "ee.orq            q6, q0, q0",
+            "ee.srci.2q        q2, q3, 1",
+            "ee.vadds.s16      q6, q6, q3",
+            "ee.srci.2q        q2, q3, 1",
+            "ee.vadds.s16      q6, q6, q3",
+            "ee.srci.2q        q2, q3, 1",
+            "ee.vadds.s16      q6, q6, q3",
+            // Same for the high half, with a zero upper pair (so lane 15+ reads 0).
+            "ee.zero.q         q4",
+            "ee.orq            q2, q4, q4",
+            "ee.orq            q3, q1, q1",
+            "ee.orq            q5, q1, q1",
+            "ee.srci.2q        q2, q3, 1",
+            "ee.vadds.s16      q5, q5, q3",
+            "ee.srci.2q        q2, q3, 1",
+            "ee.vadds.s16      q5, q5, q3",
+            "ee.srci.2q        q2, q3, 1",
+            "ee.vadds.s16      q5, q5, q3",
+            // Truncating >>4, then gather the four block sums (lanes 0/4).
+            "ee.vldbc.16       q7, {one}",
+            "wsr.sar           {sar}",
+            "ee.vmul.u16       q6, q6, q7",
+            "ee.vmul.u16       q5, q5, q7",
+            "ee.movi.32.a      q6, {b0}, 0",
+            "ee.movi.32.a      q6, {b1}, 2",
+            "ee.movi.32.a      q5, {b2}, 0",
+            "ee.movi.32.a      q5, {b3}, 2",
             p0 = in(reg) p0,
             p1 = in(reg) p1,
             p2 = in(reg) p2,
             p3 = in(reg) p3,
             one = in(reg) one,
             sar = in(reg) sar,
-            w = lateout(reg) w,
+            b0 = lateout(reg) b0,
+            b1 = lateout(reg) b1,
+            b2 = lateout(reg) b2,
+            b3 = lateout(reg) b3,
             options(nostack, readonly),
         );
     }
+    // Each `movi.32.a` word holds one block mean in its low byte.
+    let w = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
     w
 }
 
