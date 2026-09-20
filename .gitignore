@@ -1,7 +1,7 @@
 # esp-idf template
 /.vscode
 /.embuild
-/target
+target/
 /Cargo.lock
 
 # Editor configuration
