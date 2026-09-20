@@ -16,7 +16,7 @@ All algorithm modules are no_std and allocation-free (although main allocates).
 | `rbrief.rs` | Rotation-aware BRIEF descriptor: ORB intensity-centroid orientation + 256 rotated learned pairs (no libm). |
 | `matcher.rs` | Brute-force Hamming BRIEF descriptor matcher.. |
 | `localize.rs` | Matches query pyramid features to one map frame's points, then recovers pose via PnP. |
-| `ranac.rs` | Linear-DLT PnP + fixed-iteration RANSAC, plus LM pose refinement. |
+| `ransac.rs` | Linear-DLT PnP + fixed-iteration RANSAC, plus LM pose refinement. |
 | `camera.rs` | Safe wrapper over the esp32-camera driver (OV3660). |
 | `semantic.rs` | int8 calc8 embedder (esp-tflite-micro + esp-nn). |
 | `bin/main.rs` | Firmware entry. |

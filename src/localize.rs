@@ -3,7 +3,7 @@
 
 use crate::matcher::{self, DescriptorSource, Match, MatchBuffers};
 use crate::pyramid::Feature;
-use crate::ranac::{self, Camera, Correspondence, PnpBest, PnpOptions, PnpResult, Rng};
+use crate::ransac::{self, Camera, Correspondence, PnpBest, PnpOptions, PnpResult, Rng};
 use crate::rbrief::Descriptor;
 
 /// One uploaded map point: COLMAP world xyz + its rBRIEF descriptor.
@@ -69,7 +69,7 @@ pub fn localize_frame(
     let match_us = now_us().wrapping_sub(t_match);
     let t_pnp = now_us();
     let mut pnp_best = PnpBest::default();
-    let pnp = ranac::pnp_ransac_best(&s.corrs[..nc], cam, opts, rng, s.mask, &mut pnp_best);
+    let pnp = ransac::pnp_ransac_best(&s.corrs[..nc], cam, opts, rng, s.mask, &mut pnp_best);
     let pnp_us = now_us().wrapping_sub(t_pnp);
     LocalizeStats { matches: n, pnp, pnp_best, match_us, pnp_us }
 }

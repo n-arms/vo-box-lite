@@ -13,5 +13,5 @@ pub mod fast;
 pub mod localize;
 pub mod matcher;
 pub mod pyramid;
-pub mod ranac;
+pub mod ransac;
 pub mod rbrief;
