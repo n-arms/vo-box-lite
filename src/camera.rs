@@ -12,6 +12,11 @@ use esp_idf_sys::EspError;
 /// PID reported by an OV3660 sensor (c.f. `camera_pid_t_OV3660_PID` in the bindings).
 pub const OV3660_PID: u16 = 0x3660;
 
+/// AEC gain ceiling (OV3660): 10-bit real gain in 1/16x units, `[9:8]` in 0x3A18,
+/// `[7:0]` in 0x3A19. 0x0200 = 32x; RESET default 0x07C0 = 124x.
+const REG_GAIN_CEILING_H: i32 = 0x3A18;
+const REG_GAIN_CEILING_L: i32 = 0x3A19;
+
 // ---------------------------------------------------------------------------
 // Pixel format
 // ---------------------------------------------------------------------------
@@ -450,6 +455,52 @@ impl Camera {
     /// Convenience: is the attached sensor an OV3660?
     pub fn is_ov3660(&self) -> Option<bool> {
         self.sensor().map(|s| s.pid == OV3660_PID)
+    }
+
+    /// Raw driver sensor handle, `None` if the driver has no sensor state.
+    fn sensor_raw(&self) -> Option<*mut c::sensor_t> {
+        let s = unsafe { c::esp_camera_sensor_get() };
+        if s.is_null() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// Auto exposure on/off. `false` = manual, pair with [`Self::set_aec_value`].
+    /// Returns the driver return code (0 = ok), `None` if unavailable.
+    pub fn set_exposure_ctrl(&self, enable: bool) -> Option<i32> {
+        let s = self.sensor_raw()?;
+        let f = unsafe { (*s).set_exposure_ctrl }?;
+        Some(unsafe { f(s, enable as i32) })
+    }
+
+    /// Auto gain on/off. `false` = manual (pair with the driver's `set_agc_gain`).
+    pub fn set_gain_ctrl(&self, enable: bool) -> Option<i32> {
+        let s = self.sensor_raw()?;
+        let f = unsafe { (*s).set_gain_ctrl }?;
+        Some(unsafe { f(s, enable as i32) })
+    }
+
+    /// Manual exposure in units of one row time (`tROW`); only effective after
+    /// `set_exposure_ctrl(false)`. The driver clamps it to the frame's VTS.
+    pub fn set_aec_value(&self, rows: i32) -> Option<i32> {
+        let s = self.sensor_raw()?;
+        let f = unsafe { (*s).set_aec_value }?;
+        Some(unsafe { f(s, rows) })
+    }
+
+    /// AEC gain ceiling in integer x, written straight to the raw real-gain
+    /// registers (the driver's `set_gainceiling` writes the enum, ~0.25x on OV3660).
+    pub fn set_gain_ceiling(&self, gain_x: u32) -> Option<i32> {
+        let s = self.sensor_raw()?;
+        let set_reg = unsafe { (*s).set_reg }?;
+        let code = (gain_x * 16).min(0x3FF) as i32;
+        let hi = unsafe { set_reg(s, REG_GAIN_CEILING_H, 0x03, (code >> 8) & 0x03) };
+        if hi != 0 {
+            return Some(hi);
+        }
+        Some(unsafe { set_reg(s, REG_GAIN_CEILING_L, 0xFF, code & 0xFF) })
     }
 
     /// Block until a frame is ready and hand out a view over it; `None` on failure.

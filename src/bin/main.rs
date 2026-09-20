@@ -133,6 +133,15 @@ fn map_mode() -> Result<(), EspError> {
         ..camera::CameraConfig::with_pins(camera::CameraPins::FREENOVE_ESP32S3_WROOM)
     }) {
         Ok(cam) => {
+            // Manual exposure to cut motion blur; AGC auto capped at 64x.
+            // set_gain_ceiling writes the raw gain registers (the driver enum is broken).
+            let aec = cam.set_exposure_ctrl(false);
+            let agc = cam.set_gain_ctrl(true);
+            let aecv = cam.set_aec_value(45);
+            let ceil = cam.set_gain_ceiling(64);
+            log::info!(
+                "camera exposure: manual aec=45, gain auto, ceiling 64x (rets {aec:?}/{agc:?}/{aecv:?}/{ceil:?})"
+            );
             log::info!("camera ready");
             Some(cam)
         }

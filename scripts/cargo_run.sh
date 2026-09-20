@@ -80,18 +80,18 @@ else
     echo "ERROR: $PT_BIN not found; the 'model' partition will be missing" >&2
 fi
 
-# --- 2b) flash the semantic model blob (int8 yolov8n) to its partition ------
-# Offset must match the `model` row in partitions.csv. Build the blob with
-# scripts/export_tflite.py. Absent -> the semantic task idles (logs an error).
+# --- 2b) flash the semantic model blob (int8 calc8) to its partition --------
+# Offset must match the `model` row in partitions.csv. Absent -> the semantic
+# task idles (logs an error).
 MODEL_OFFSET="${MODEL_OFFSET:-0x400000}"
-MODEL_TFLITE="${MODEL_TFLITE:-models/yolov8n.tflite}"
+MODEL_TFLITE="${MODEL_TFLITE:-models/calc8.tflite}"
 if [ -f "$MODEL_TFLITE" ]; then
     echo "writing $MODEL_TFLITE -> $MODEL_OFFSET (model partition)..."
     if ! espflash write-bin --port "$port" "$MODEL_OFFSET" "$MODEL_TFLITE"; then
         echo "WARNING: model write failed; the semantic task will idle" >&2
     fi
 else
-    echo "note: $MODEL_TFLITE not found — run scripts/export_tflite.py (semantic task will idle)"
+    echo "note: $MODEL_TFLITE not found — copy it from calc-quant/quant/calc_int8.tflite (semantic task will idle)"
 fi
 
 # --- 3) detach usbipd so the COM port is free on the Windows side ----------

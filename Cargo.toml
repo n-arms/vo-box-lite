@@ -54,9 +54,9 @@ extra_components = [
     { remote_component = { name = "espressif/esp32-camera", version = "2.1.7" },
       bindings_header = "esp32_camera_bindings.h",
       bindings_module = "camera" },
-    # esp-tflite-micro runs the int8 yolov8n model (it pulls esp-nn as its
-    # optimized kernel backend). components/semantic is a local C shim over the
-    # C++ MicroInterpreter API; bindgen exposes it as esp_idf_sys::tflite.
+    # esp-tflite-micro runs the int8 calc8 (CALC encoder) model (it pulls esp-nn
+    # as its optimized kernel backend). components/semantic is a local C shim over
+    # the C++ MicroInterpreter API; bindgen exposes it as esp_idf_sys::tflite.
     { component_dirs = ["components/semantic"],
       remote_component = { name = "espressif/esp-tflite-micro", version = "1.4.1" },
       bindings_header = "components/semantic/tflite_shim.h",

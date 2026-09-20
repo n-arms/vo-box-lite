@@ -1,6 +1,6 @@
 # Custom table for 8 MB flash. `factory` is oversized to fit the app + the
-# esp-tflite-micro runtime; `model` (raw subtype 0x40) holds the int8 yolov8n
-# .tflite blob, flashed at 0x400000 by scripts/cargo_run.sh.
+# esp-tflite-micro runtime; `model` (raw subtype 0x40) holds the int8 calc8
+# (CALC encoder) .tflite blob, flashed at 0x400000 by scripts/cargo_run.sh.
 # Name,   Type, SubType, Offset,   Size,     Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,

@@ -24,6 +24,7 @@
 
 # Output of scripts/receive_frames.py (saved BMP frames)
 /frames/
+test-images/
 
 # Python bytecode cache
 **/__pycache__/
@@ -32,6 +33,7 @@
 /map_run/
 /out.log
 /crashlog
+out.txt
 
 # Semantic task: onnx2tf venv + generated model artifacts (large binaries)
 /scripts/.tflite-venv/
