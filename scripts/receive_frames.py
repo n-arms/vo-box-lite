@@ -14,8 +14,9 @@ MAGIC_VOX1 = b"VOX1"
 MAGIC_VOX2 = b"VOX2"
 MAGIC_VOXD = b"VOXD"
 MAGIC_STRT = b"STRT"  # laptop -> ESP: kick the map task off
-MAGIC_MAPU = b"MAPU"  # laptop -> ESP: upload the built localization map
-MAGIC_MAPK = b"MAPK"  # ESP -> laptop: map upload ack (u32 n_points)
+MAGIC_MAP_UPLOAD = b"MAP2"  # laptop -> ESP: upload the built localization map
+                             # (per-frame {1064 B embedding, points})
+MAGIC_MAPK = b"MAPK"  # ESP -> laptop: ack (u32 n_frames, u32 n_points)
 FMT_GRAYSCALE = 3  # esp32-camera PIXFORMAT_GRAYSCALE
 DOT_RADIUS = 2     # feature marker radius in px
 
@@ -113,9 +114,9 @@ def read_record(conn: socket.socket):
         frames, features = struct.unpack("<II", payload[4:12])
         return "VOXD", (frames, features)
     if magic == MAGIC_MAPK:
-        # payload-after-magic = u32 n_points stored by the ESP
-        (n_points,) = struct.unpack("<I", payload[4:8])
-        return "MAPK", n_points
+        # payload-after-magic = u32 n_frames, u32 n_points stored by the ESP
+        n_frames, n_points = struct.unpack("<II", payload[4:12])
+        return "MAPK", (n_frames, n_points)
     raise ValueError(f"bad magic {magic!r} — stream out of sync")
 
 

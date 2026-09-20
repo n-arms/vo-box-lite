@@ -1,6 +1,7 @@
 //! SoftAP + TCP server: on connect the laptop sends STRT (map run: streams VOX2
-//! frames, ends with VOXD) or MAPU (upload a built map + intrinsics; MCU stores
-//! it and idles in localize mode). See scripts/receive_map.py for the protocol.
+//! frames, ends with VOXD) or MAP2 (upload a built map: per-frame calc8
+//! embedding + its triangulated points; MCU stores it and idles in localize
+//! mode). See scripts/receive_map.py for the protocol.
 
 // The old map/localize entry point is kept but unused while the semantic task
 // (src/semantic.rs) is the startup task.
@@ -42,14 +43,20 @@ const DEFAULT_INTERVAL_MS: u64 = 1000;
 const START_TIMEOUT_S: u64 = 60;
 /// Record magic for the final "done mapping" record.
 const MAGIC_DONE: &[u8; 4] = b"VOXD";
-/// Laptop -> MCU map upload: `u32 LE n | "MAPU" | u8 model | 4 x f32 params |
-/// u32 n_points | n_points x {f32 x,y,z, 32 B desc}` (n = full record length).
-const MAGIC_MAP_UPLOAD: &[u8; 4] = b"MAPU";
-/// MCU -> laptop map-upload ack: `u32 LE n` (= 8) | b"MAPK" | u32 LE n_points.
+/// Laptop -> MCU map upload (v2): `u32 LE n | "MAP2" | u8 model | 4 x f32
+/// params | u32 n_frames | n_frames x {u8 embedding[1064] | u32 n_points |
+/// n_points x {f32 x,y,z, 32 B desc}}` (n = full record length).
+const MAGIC_MAP_UPLOAD: &[u8; 4] = b"MAP2";
+/// MCU -> laptop map-upload ack: `u32 LE n` (= 12) | b"MAPK" | u32 LE n_frames
+/// | u32 LE n_points.
 const MAGIC_MAP_OK: &[u8; 4] = b"MAPK";
-/// Camera model ids accepted in a MAPU header (COLMAP `SIMPLE_RADIAL` only).
+/// Camera model ids accepted in a MAP2 header (COLMAP `SIMPLE_RADIAL` only).
 const CAMERA_MODEL_SIMPLE_RADIAL: u8 = 1;
-/// Sanity cap on uploaded points (44 B each) to bound the PSRAM allocation.
+/// calc8 place-recognition descriptor width (bytes) per map frame.
+const EMBEDDING_DIM: usize = 1064;
+/// Sanity cap on uploaded frames (1064 B embedding + its points each).
+const MAX_MAP_FRAMES: usize = 1024;
+/// Sanity cap on uploaded points total (44 B each), across all frames.
 const MAX_MAP_POINTS: usize = 100_000;
 /// Record magic for frame+features (VOX2).
 const MAGIC: &[u8; 4] = b"VOX2";
@@ -140,7 +147,7 @@ fn map_mode() -> Result<(), EspError> {
 }
 
 /// Serve one connection = one command: STRT streams paced VOX2 frames until the
-/// run deadline then sends VOXD; MAPU stores the uploaded map and acks. Either
+/// run deadline then sends VOXD; MAP2 stores the uploaded map and acks. Either
 /// way the connection is dropped and the next one accepted.
 fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
     // Pipeline buffers are sized for the VGA frame dims and reused every frame
@@ -159,7 +166,11 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
         };
         log::info!("laptop connected: {peer} — waiting for its command");
         match map.as_ref() {
-            Some(m) => log::info!("localize map loaded ({} points)", m.points.len()),
+            Some(m) => log::info!(
+                "localize map loaded ({} frames, {} points)",
+                m.frames.len(),
+                m.frames.iter().map(|f| f.points.len()).sum::<usize>()
+            ),
             None => log::info!("no localize map loaded"),
         }
         // Disable Nagle (pairs with the enlarged lwIP send buffer in sdkconfig).
@@ -172,15 +183,19 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
         let p = pipe.as_mut().unwrap();
 
         // The MCU streams nothing until a command arrives: STRT starts a run,
-        // MAPU stores a map. Clean disconnect -> Ok(None); timeout/garbage -> Err.
+        // MAP2 stores a map. Clean disconnect -> Ok(None); timeout/garbage -> Err.
         let (dur_s, interval_ms) = match read_command(&mut stream) {
             Ok(Some(Command::Start { duration_s, interval_ms })) => (duration_s, interval_ms),
             Ok(Some(Command::MapUpload(m))) => {
-                let n_points = m.points.len() as u32;
-                log::info!("map upload: {n_points} points, model {}, params {:?}",
-                           m.model, m.params);
+                let n_frames = m.frames.len() as u32;
+                let n_points: u32 =
+                    m.frames.iter().map(|f| f.points.len()).sum::<usize>() as u32;
+                log::info!(
+                    "map upload: {n_frames} frames / {n_points} points, model {}, params {:?}",
+                    m.model, m.params
+                );
                 map = Some(m);
-                build_map_ok_record(&mut p.tx, n_points);
+                build_map_ok_record(&mut p.tx, n_frames, n_points);
                 if let Err(e) = send_record(&mut stream, &p.tx) {
                     log::warn!("map ack send failed ({e})");
                 } else {
@@ -287,12 +302,18 @@ enum Command {
     MapUpload(LocalMap),
 }
 
-/// Uploaded map: COLMAP-refined intrinsics + 3D points with rBRIEF descriptors.
-/// Held in PSRAM until the next upload / reboot.
+/// Uploaded map: COLMAP-refined intrinsics + per-frame calc8 embedding with the
+/// frame's triangulated points. Held in PSRAM until the next upload / reboot.
 struct LocalMap {
     model: u8,
     /// SIMPLE_RADIAL params: f, cx, cy, k1.
     params: [f32; 4],
+    frames: Vec<LocalMapFrame>,
+}
+
+struct LocalMapFrame {
+    /// calc8 place-recognition descriptor for this frame.
+    embedding: [u8; EMBEDDING_DIM],
     points: Vec<LocalMapPoint>,
 }
 
@@ -302,8 +323,8 @@ struct LocalMapPoint {
     desc: rbrief::Descriptor,
 }
 
-/// Read the laptop's command (STRT = map run, MAPU = map upload). Ok(None) on a
-/// clean disconnect, Err on timeout / bad record. MAPU leaves the stream
+/// Read the laptop's command (STRT = map run, MAP2 = map upload). Ok(None) on a
+/// clean disconnect, Err on timeout / bad record. MAP2 leaves the stream
 /// blocking; STRT leaves it non-blocking.
 fn read_command(stream: &mut TcpStream) -> std::io::Result<Option<Command>> {
     let deadline = Instant::now() + Duration::from_secs(START_TIMEOUT_S);
@@ -358,8 +379,9 @@ fn read_command(stream: &mut TcpStream) -> std::io::Result<Option<Command>> {
     ))
 }
 
-/// Parse a MAPU body (magic already read; `n` = full record length): u8 model,
-/// 4 x f32 params, u32 n_points, then n_points x {f32 x,y,z, 32 B descriptor}.
+/// Parse a MAP2 body (magic already read; `n` = full record length): u8 model,
+/// 4 x f32 params, u32 n_frames, then per frame a 1064 B embedding + u32
+/// n_points + n_points x {f32 x,y,z, 32 B descriptor}.
 fn read_map_upload(stream: &mut TcpStream, n: usize) -> std::io::Result<LocalMap> {
     const HEADER: usize = 1 + 4 * 4 + 4;
     if n < 4 + HEADER {
@@ -381,29 +403,54 @@ fn read_map_upload(stream: &mut TcpStream, n: usize) -> std::io::Result<LocalMap
     for (i, p) in params.iter_mut().enumerate() {
         *p = f32::from_le_bytes(hdr[1 + i * 4..5 + i * 4].try_into().unwrap());
     }
-    let n_points = u32::from_le_bytes(hdr[17..21].try_into().unwrap()) as usize;
+    let n_frames = u32::from_le_bytes(hdr[17..21].try_into().unwrap()) as usize;
     let body_bytes = n - 4 - HEADER;
-    if n_points > MAX_MAP_POINTS || body_bytes != n_points * 44 {
+    if n_frames > MAX_MAP_FRAMES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("map point count {n_points} != {body_bytes} B payload"),
+            format!("map frame count {n_frames} > {MAX_MAP_FRAMES}"),
         ));
     }
-    let mut points = Vec::with_capacity(n_points);
-    let mut buf = [0u8; 44];
-    for _ in 0..n_points {
-        stream.read_exact(&mut buf)?;
-        let mut xyz = [0f32; 3];
-        for (i, v) in xyz.iter_mut().enumerate() {
-            *v = f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+    let mut frames = Vec::with_capacity(n_frames);
+    let mut total_points = 0usize;
+    let mut consumed = 0usize;
+    for _ in 0..n_frames {
+        let mut embedding = [0u8; EMBEDDING_DIM];
+        stream.read_exact(&mut embedding)?;
+        let mut nb = [0u8; 4];
+        stream.read_exact(&mut nb)?;
+        let np = u32::from_le_bytes(nb) as usize;
+        total_points += np;
+        if total_points > MAX_MAP_POINTS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("map point count {total_points} > {MAX_MAP_POINTS}"),
+            ));
         }
-        let mut desc = [0u32; 8];
-        for (w, d) in desc.iter_mut().enumerate() {
-            *d = u32::from_le_bytes(buf[12 + w * 4..16 + w * 4].try_into().unwrap());
+        let mut points = Vec::with_capacity(np);
+        let mut buf = [0u8; 44];
+        for _ in 0..np {
+            stream.read_exact(&mut buf)?;
+            let mut xyz = [0f32; 3];
+            for (i, v) in xyz.iter_mut().enumerate() {
+                *v = f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+            }
+            let mut desc = [0u32; 8];
+            for (w, d) in desc.iter_mut().enumerate() {
+                *d = u32::from_le_bytes(buf[12 + w * 4..16 + w * 4].try_into().unwrap());
+            }
+            points.push(LocalMapPoint { xyz, desc });
         }
-        points.push(LocalMapPoint { xyz, desc });
+        consumed += EMBEDDING_DIM + 4 + np * 44;
+        frames.push(LocalMapFrame { embedding, points });
     }
-    Ok(LocalMap { model, params, points })
+    if consumed != body_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("map payload {consumed} B != {body_bytes} B declared"),
+        ));
+    }
+    Ok(LocalMap { model, params, frames })
 }
 
 /// Read exactly `buf.len()` bytes, tolerating WouldBlock (non-blocking socket)
@@ -526,12 +573,14 @@ fn build_done_record(buf: &mut Vec<u8>, frames: u64, features: u64) {
     buf.extend_from_slice(&(features as u32).to_le_bytes());
 }
 
-/// Assemble the MAPK map-upload ack into `buf`: length | magic | n_points.
-fn build_map_ok_record(buf: &mut Vec<u8>, n_points: u32) {
-    let payload = 8;
+/// Assemble the MAPK map-upload ack into `buf`: length | magic | n_frames |
+/// n_points.
+fn build_map_ok_record(buf: &mut Vec<u8>, n_frames: u32, n_points: u32) {
+    let payload = 12;
     buf.clear();
     buf.extend_from_slice(&(payload as u32).to_le_bytes());
     buf.extend_from_slice(MAGIC_MAP_OK);
+    buf.extend_from_slice(&n_frames.to_le_bytes());
     buf.extend_from_slice(&n_points.to_le_bytes());
 }
 

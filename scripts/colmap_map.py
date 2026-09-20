@@ -274,12 +274,24 @@ def reconstruct_feature_positions(
     inv_id_map = {v: k for k, v in id_map.items()}
     result: Dict[Tuple[int, int], np.ndarray] = {}
 
-    for recon in reconstructions.values():
-        for point3D in recon.points3D.values():
-            xyz = np.array(point3D.xyz)
-            for el in point3D.track.elements:
-                orig_image_id = inv_id_map[el.image_id]
-                result[(orig_image_id, el.point2D_idx)] = xyz
+    # Images can split into several disconnected models, each with its own
+    # arbitrary world frame, so merging their points corrupts the map. Keep only
+    # the largest model and persist it: map assembly must read this exact model's
+    # camera (the root of `sparse/` is not necessarily the biggest one).
+    best = max(reconstructions.values(), key=lambda r: r.num_images())
+    if stats is not None:
+        stats["best_model"] = (best.num_images(), best.num_points3D())
+    for point3D in best.points3D.values():
+        xyz = np.array(point3D.xyz)
+        for el in point3D.track.elements:
+            orig_image_id = inv_id_map[el.image_id]
+            result[(orig_image_id, el.point2D_idx)] = xyz
+
+    best_dir = workdir / "sparse" / "best"
+    best_dir.mkdir(parents=True, exist_ok=True)
+    best.write(str(best_dir))
+    print(f"keeping largest of {len(reconstructions)} model(s): "
+          f"{best.num_images()} images, {best.num_points3D()} points -> {best_dir}")
 
     return result
 
