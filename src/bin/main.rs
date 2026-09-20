@@ -29,7 +29,7 @@ use vo_box_lite::localize;
 use vo_box_lite::localize::MapPoint;
 use vo_box_lite::matcher;
 use vo_box_lite::pyramid;
-use vo_box_lite::ranac;
+use vo_box_lite::ransac;
 
 /// SoftAP credentials the laptop joins with (WPA2 passphrase must be >= 8 chars).
 const AP_SSID: &str = "vo-box";
@@ -409,12 +409,12 @@ struct Localizer {
     point_query: Vec<u32>,
     point_dist: Vec<u32>,
     matches: Vec<matcher::Match>,
-    corrs: Vec<ranac::Correspondence>,
+    corrs: Vec<ransac::Correspondence>,
     mask: Vec<bool>,
     frame: Vec<u8>,
     /// Query calc8 descriptor (kept off the small main-task stack).
     emb: [u8; EMBEDDING_DIM],
-    rng: ranac::Xorshift64,
+    rng: ransac::Xorshift64,
 }
 
 impl Localizer {
@@ -440,13 +440,13 @@ impl Localizer {
             point_dist: vec![0u32; np],
             matches: vec![matcher::Match::default(); nf],
             corrs: vec![
-                ranac::Correspondence { world: [0.0; 3], xn: 0.0, yn: 0.0 };
+                ransac::Correspondence { world: [0.0; 3], xn: 0.0, yn: 0.0 };
                 nf
             ],
             mask: vec![false; nf],
             frame: vec![0u8; w * h],
             emb: [0u8; EMBEDDING_DIM],
-            rng: ranac::Xorshift64::new(now_us() | 1),
+            rng: ransac::Xorshift64::new(now_us() | 1),
         })
     }
 
@@ -455,8 +455,8 @@ impl Localizer {
         &mut self,
         nfeat: usize,
         points: &[MapPoint],
-        cam: &ranac::Camera,
-        opts: &ranac::PnpOptions,
+        cam: &ransac::Camera,
+        opts: &ransac::PnpOptions,
     ) -> localize::LocalizeStats {
         let mut scratch = localize::LocalizeScratch {
             mb: matcher::MatchBuffers {
@@ -491,14 +491,14 @@ fn run_localize(
     map: &LocalMap,
     loc: &mut Localizer,
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
-    let cam_model = ranac::Camera {
+    let cam_model = ransac::Camera {
         fx: map.params[0],
         fy: map.params[0],
         cx: map.params[1],
         cy: map.params[2],
         k1: map.params[3],
     };
-    let opts = ranac::PnpOptions::default();
+    let opts = ransac::PnpOptions::default();
     // Non-blocking so a new laptop command can interrupt the localize loop.
     listener.set_nonblocking(true)?;
     log::info!(
