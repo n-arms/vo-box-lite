@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Map-run driver: send STRT to kick a run off, save the streamed VOX2 frames
-+ features under <work>/ (bmps/, marked/, features/), then on the VOXD done
-record build map.txt + map_report.txt (match -> COLMAP). --rebuild: no ESP.
+"""Map-run driver: send STRT to kick a run off, save the streamed raw VOX2
+frames under <work>/ (raw/, bmps/, marked/), re-extract features on the laptop
+with the S3's own Rust extractor, then on the VOXD done record build map.txt +
+map_report.txt (match -> COLMAP). --rebuild: no ESP.
 """
 
 import argparse
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -19,11 +21,17 @@ import receive_frames as rf  # record parsing + BMP/CSV writers
 
 MIN_FEATURES = 20      # frames with fewer features are dropped before matching
 MIN_USABLE_FRAMES = 3  # below this, COLMAP has no chance — give up gracefully
+MIN_FRAME_POINTS = 8   # a map frame needs this many triangulated points (PnP min)
+
+# Host feature extraction (scripts/extract_host.rs): compiled with plain
+# `rustc +stable` (no cargo / no ESP deps) and run over the raw/ frames. It
+# #[path]-includes the exact S3 source modules, so the descriptors are identical.
+EXTRACT_HOST_SRC = Path(__file__).resolve().parent / "extract_host.rs"
 
 
 def fresh_dirs(work: Path) -> None:
     """Wipe + recreate per-run output dirs under `work` (a fresh run)."""
-    for sub in ("bmps", "marked", "features", "colmap_work"):
+    for sub in ("raw", "bmps", "marked", "features", "embeddings", "colmap_work"):
         d = work / sub
         if d.exists():
             shutil.rmtree(d)
@@ -46,6 +54,7 @@ def receive_run(args, work: Path) -> None:
         # connect must not destroy the last good capture in <work>).
         fresh_dirs(work)
         bmps, features, marked = work / "bmps", work / "features", work / "marked"
+        raw = work / "raw"
         # The MCU idles until commanded: send STRT to kick the map task off.
         rf.send_start(conn, args.duration, args.interval)
         print(f"STRT sent: {args.duration}s run at one frame per {args.interval} ms "
@@ -77,11 +86,12 @@ def receive_run(args, work: Path) -> None:
                 continue
             idx += 1
             stem = f"IMG{idx:04d}"
+            (raw / f"{stem}.bit").write_bytes(pixels)
             rf.write_gray_bmp(bmps / f"{stem}.bmp", w, h, pixels)
             rf.write_feature_csv(features / f"{stem}.csv", feats)
             rf.write_marked_bmp(marked / f"{stem}_marked.bmp", w, h, pixels, feats)
             print(f"[{time.strftime('%H:%M:%S')}] {stem}: {w}x{h}, {len(feats)} "
-                  f"features ({idx} so far)")
+                  f"features from ESP — laptop extracts ({idx} so far)")
             if timings:
                 # Per-frame perf over WiFi (the ESP's console UART dies when a
                 # station joins, so the breakdown rides on the record).
@@ -108,6 +118,24 @@ def build_from_work(work: Path, args) -> int:
     def note(line=""):
         report.append(line)
         print(line)
+
+    # ---- 0. laptop-side feature extraction ---------------------------------
+    # The firmware streams raw frames only (0 features on the wire), so
+    # re-extract here with the exact S3 Rust extractor: map descriptors then
+    # match the on-device localize queries bit-for-bit. Older captures (or a
+    # --rebuild of one) have no raw/ and keep the CSVs saved during receive.
+    raw_dir = work / "raw"
+    if raw_dir.is_dir() and any(raw_dir.glob("*.bit")):
+        from PIL import Image
+        with Image.open(bmp_files[0]) as im:
+            fw, fh = im.size
+        try:
+            extract_features_host(work, fw, fh, note)
+        except RuntimeError as e:
+            print(f"!! {e}", file=sys.stderr)
+            return 1
+    else:
+        note("no raw/ frames — using the features saved during receive")
 
     # ---- 1. drop feature-starved frames (< min features). Matches are
     # computed afterwards, so nothing else needs filtering --------------------
@@ -207,10 +235,29 @@ def build_from_work(work: Path, args) -> int:
     note(f"COLMAP: verified {stats.get('pairs_verified', '?')}/{len(matches)} "
          f"image pairs; triangulated {len(positions)}/{total_features} features")
 
+    # ---- 2b. offline calc8 place-recognition embeddings --------------------
+    # One 1064-B descriptor per frame with the device-identical preprocessing
+    # (truncating 4x4 block mean -> 160x120), so map frames can be selected by
+    # place without rerunning the encoder.
+    import embed_host
+    t0 = time.time()
+    try:
+        embs = embed_host.compute_embeddings(bmp_files)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"!! embedding failed: {e}", file=sys.stderr)
+        return 1
+    emb_dir = work / "embeddings"
+    emb_dir.mkdir(exist_ok=True)
+    for stem, b in embs.items():
+        np.save(emb_dir / f"{stem}.npy", np.frombuffer(b, dtype=np.uint8))
+    note(f"embeddings: {len(embs)} frames @ {embed_host.EMB_DIM} B "
+         f"({time.time()-t0:.1f}s, calc8 offline)")
+
     # ---- 3. map.txt + quality report ---------------------------------------
     try:
         summary = write_map.build_map_file(
-            work / "colmap_work", features, work / "map.txt")
+            work / "colmap_work", features, work / "map.txt",
+            embeddings=embs, min_points=MIN_FRAME_POINTS)
     except Exception as e:
         print(f"!! map assembly failed: {e}", file=sys.stderr)
         return 1
@@ -223,7 +270,9 @@ def build_from_work(work: Path, args) -> int:
         note(f"camera SIMPLE_RADIAL (focal guessed {f0:.1f} @ {cx0:.0f},{cy0:.0f} "
              f"-> refined f={f:.2f} cx={cx:.2f} cy={cy:.2f} k1={k1:.4f})")
     note(f"registered images: {summary['n_images']}/{len(images)}")
-    note(f"map points: {summary['n_map_points']} "
+    note(f"map frames: {summary['n_frames']} with >= {MIN_FRAME_POINTS} "
+         f"triangulated points (of {len(embs)} embedded)")
+    note(f"map points: {summary['n_map_points']} per-frame observations "
          f"(from {summary['n_points3d']} COLMAP 3D points; "
          f"skipped {summary['skipped']})")
     if summary["point_reproj_err"]:
@@ -239,15 +288,54 @@ def build_from_work(work: Path, args) -> int:
     return 0
 
 
+def ensure_extract_host(work: Path) -> Path:
+    """Compile scripts/extract_host.rs with the host stable toolchain unless a
+    cached binary is newer than the harness and every included source module."""
+    exe = work / "extract_host"
+    src_dir = EXTRACT_HOST_SRC.parent.parent / "src"
+    newest = EXTRACT_HOST_SRC.stat().st_mtime
+    # The harness `#[path]`-includes these; rebuild if any changed.
+    for p in src_dir.glob("*.rs"):
+        newest = max(newest, p.stat().st_mtime)
+    if exe.exists() and exe.stat().st_mtime >= newest:
+        return exe
+    print(f"compiling {EXTRACT_HOST_SRC.name} (rustc +stable) ...")
+    try:
+        subprocess.run(
+            ["rustc", "+stable", "--edition", "2021", "-O",
+             str(EXTRACT_HOST_SRC), "-o", str(exe)],
+            check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "rustc not found — laptop feature extraction needs a Rust toolchain "
+            "(run the build in WSL, or `rustup toolchain install stable`)"
+        )
+    return exe
+
+
+def extract_features_host(work: Path, w: int, h: int, note) -> None:
+    """Run the S3's own extractor on every raw/<IMG>.bit -> features/<IMG>.csv."""
+    exe = ensure_extract_host(work)
+    note(f"laptop feature extraction: {w}x{h}, same Rust extractor as the S3")
+    subprocess.run(
+        [str(exe), str(work / "raw"), str(work / "features"), str(w), str(h)],
+        check=True,
+    )
+
+
 # COLMAP camera model name -> on-wire id (must match CAMERA_MODEL_* in
 # src/bin/main.rs). Only SIMPLE_RADIAL is produced by colmap_map.py.
 CAMERA_MODEL_IDS = {"SIMPLE_RADIAL": 1}
+EMBEDDING_BYTES = 1064  # calc8 descriptor (must match EMBEDDING_DIM in main.rs)
 
 
 def load_map_txt(path: Path):
-    """Parse map.txt -> (model_id, [f, cx, cy, k1], [(x, y, z, desc_bytes)])."""
+    """Parse map.txt -> (model_id, [f, cx, cy, k1], frames) where frames is a
+    list of (embedding_bytes, [(x, y, z, desc_bytes), ...])."""
     model_id = params = None
-    points = []
+    frames = []
+    cur = None
     with open(path) as f:
         for line in f:
             t = line.split()
@@ -260,39 +348,54 @@ def load_map_txt(path: Path):
                 params = [float(v) for v in t[2:6]]
                 if len(params) != 4:
                     raise ValueError(f"expected 4 SIMPLE_RADIAL params, got {t[2:]}")
+            elif t[0] == "FRAME":
+                emb = bytes.fromhex(t[2])
+                if len(emb) != EMBEDDING_BYTES:
+                    raise ValueError(f"embedding is {len(emb)} B, expected "
+                                     f"{EMBEDDING_BYTES}")
+                cur = (emb, [])
+                frames.append(cur)
             elif t[0] == "POINT":
+                if cur is None:
+                    raise ValueError(f"POINT before any FRAME in {path}")
                 desc = bytes.fromhex(t[4])
                 if len(desc) != 32:
                     raise ValueError(f"descriptor is {len(desc)} B, expected 32")
-                points.append((float(t[1]), float(t[2]), float(t[3]), desc))
+                cur[1].append((float(t[1]), float(t[2]), float(t[3]), desc))
     if model_id is None:
         raise ValueError(f"no CAMERA line in {path}")
-    if not points:
-        raise ValueError(f"no POINT lines in {path}")
-    return model_id, params, points
+    if not frames:
+        raise ValueError(f"no FRAME lines in {path}")
+    return model_id, params, frames
 
 
 def upload_map(args, map_path: Path) -> None:
-    """Send the built map (intrinsics + 3D points + descriptors) to the ESP
-    (MAPU) and wait for its MAPK ack. Fresh connection: the run's was dropped."""
-    model_id, params, points = load_map_txt(map_path)
-    body = bytearray(rf.MAGIC_MAPU)
+    """Send the built map (intrinsics + per-frame embedding + its points) to
+    the ESP (MAP2) and wait for its MAPK ack. Fresh connection: run's dropped."""
+    model_id, params, frames = load_map_txt(map_path)
+    body = bytearray(rf.MAGIC_MAP_UPLOAD)
     body.append(model_id)
     body += struct.pack("<4f", *params)
-    body += struct.pack("<I", len(points))
-    for (x, y, z, desc) in points:
-        body += struct.pack("<3f", x, y, z) + desc
-    print(f"uploading map: {len(points)} points, camera model {model_id}, "
-          f"params {['%.4g' % p for p in params]}, {len(body) + 4} bytes "
-          f"-> {args.host}:{args.port}")
+    body += struct.pack("<I", len(frames))
+    n_points = 0
+    for emb, points in frames:
+        body += emb
+        body += struct.pack("<I", len(points))
+        for (x, y, z, desc) in points:
+            body += struct.pack("<3f", x, y, z) + desc
+        n_points += len(points)
+    print(f"uploading map: {len(frames)} frames / {n_points} points, camera "
+          f"model {model_id}, params {['%.4g' % p for p in params]}, "
+          f"{len(body) + 4} bytes -> {args.host}:{args.port}")
     with socket.create_connection((args.host, args.port), timeout=15) as conn:
-        conn.settimeout(60)  # ESP ack after it has read + stored the points
+        conn.settimeout(60)  # ESP ack after it has read + stored the frames
         conn.sendall(struct.pack("<I", len(body)) + bytes(body))
         kind, payload = rf.read_record(conn)
         if kind != "MAPK":
             raise ConnectionError(f"expected MAPK ack, got {kind}")
-        print(f"map accepted: ESP stored {payload} points — firmware is now in "
-              f"localize mode (idle until the next map run)")
+        n_frames, n_points = payload
+        print(f"map accepted: ESP stored {n_frames} frames / {n_points} points "
+              f"— firmware is now in localize mode (idle until the next map run)")
 
 
 def main() -> int:

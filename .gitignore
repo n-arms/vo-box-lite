@@ -39,3 +39,6 @@ out.txt
 /scripts/.tflite-venv/
 /models/
 /calibration_image_sample_data_*.npy
+
+# Host feature extractor built by receive_map.py
+**/extract_host
