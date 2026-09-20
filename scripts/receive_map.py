@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Map-run driver: send STRT to kick a run off, save the streamed VOX2 frames
-+ features under <work>/ (bmps/, marked/, features/), then on the VOXD done
-record build map.txt + map_report.txt (match -> COLMAP). --rebuild: no ESP.
+"""Map-run driver: send STRT to kick a run off, save the streamed raw VOX2
+frames under <work>/ (raw/, bmps/, marked/), re-extract features on the laptop
+with the S3's own Rust extractor, then on the VOXD done record build map.txt +
+map_report.txt (match -> COLMAP). --rebuild: no ESP.
 """
 
 import argparse
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -20,10 +22,15 @@ import receive_frames as rf  # record parsing + BMP/CSV writers
 MIN_FEATURES = 20      # frames with fewer features are dropped before matching
 MIN_USABLE_FRAMES = 3  # below this, COLMAP has no chance — give up gracefully
 
+# Host feature extraction (scripts/extract_host.rs): compiled with plain
+# `rustc +stable` (no cargo / no ESP deps) and run over the raw/ frames. It
+# #[path]-includes the exact S3 source modules, so the descriptors are identical.
+EXTRACT_HOST_SRC = Path(__file__).resolve().parent / "extract_host.rs"
+
 
 def fresh_dirs(work: Path) -> None:
     """Wipe + recreate per-run output dirs under `work` (a fresh run)."""
-    for sub in ("bmps", "marked", "features", "colmap_work"):
+    for sub in ("raw", "bmps", "marked", "features", "colmap_work"):
         d = work / sub
         if d.exists():
             shutil.rmtree(d)
@@ -46,6 +53,7 @@ def receive_run(args, work: Path) -> None:
         # connect must not destroy the last good capture in <work>).
         fresh_dirs(work)
         bmps, features, marked = work / "bmps", work / "features", work / "marked"
+        raw = work / "raw"
         # The MCU idles until commanded: send STRT to kick the map task off.
         rf.send_start(conn, args.duration, args.interval)
         print(f"STRT sent: {args.duration}s run at one frame per {args.interval} ms "
@@ -77,11 +85,12 @@ def receive_run(args, work: Path) -> None:
                 continue
             idx += 1
             stem = f"IMG{idx:04d}"
+            (raw / f"{stem}.bit").write_bytes(pixels)
             rf.write_gray_bmp(bmps / f"{stem}.bmp", w, h, pixels)
             rf.write_feature_csv(features / f"{stem}.csv", feats)
             rf.write_marked_bmp(marked / f"{stem}_marked.bmp", w, h, pixels, feats)
             print(f"[{time.strftime('%H:%M:%S')}] {stem}: {w}x{h}, {len(feats)} "
-                  f"features ({idx} so far)")
+                  f"features from ESP — laptop extracts ({idx} so far)")
             if timings:
                 # Per-frame perf over WiFi (the ESP's console UART dies when a
                 # station joins, so the breakdown rides on the record).
@@ -108,6 +117,24 @@ def build_from_work(work: Path, args) -> int:
     def note(line=""):
         report.append(line)
         print(line)
+
+    # ---- 0. laptop-side feature extraction ---------------------------------
+    # The firmware streams raw frames only (0 features on the wire), so
+    # re-extract here with the exact S3 Rust extractor: map descriptors then
+    # match the on-device localize queries bit-for-bit. Older captures (or a
+    # --rebuild of one) have no raw/ and keep the CSVs saved during receive.
+    raw_dir = work / "raw"
+    if raw_dir.is_dir() and any(raw_dir.glob("*.bit")):
+        from PIL import Image
+        with Image.open(bmp_files[0]) as im:
+            fw, fh = im.size
+        try:
+            extract_features_host(work, fw, fh, note)
+        except RuntimeError as e:
+            print(f"!! {e}", file=sys.stderr)
+            return 1
+    else:
+        note("no raw/ frames — using the features saved during receive")
 
     # ---- 1. drop feature-starved frames (< min features). Matches are
     # computed afterwards, so nothing else needs filtering --------------------
@@ -237,6 +264,42 @@ def build_from_work(work: Path, args) -> int:
     (work / "map_report.txt").write_text("\n".join(header + [""] + report) + "\n")
     print(f"\nwrote {work / 'map.txt'} and {work / 'map_report.txt'}")
     return 0
+
+
+def ensure_extract_host(work: Path) -> Path:
+    """Compile scripts/extract_host.rs with the host stable toolchain unless a
+    cached binary is newer than the harness and every included source module."""
+    exe = work / "extract_host"
+    src_dir = EXTRACT_HOST_SRC.parent.parent / "src"
+    newest = EXTRACT_HOST_SRC.stat().st_mtime
+    # The harness `#[path]`-includes these; rebuild if any changed.
+    for p in src_dir.glob("*.rs"):
+        newest = max(newest, p.stat().st_mtime)
+    if exe.exists() and exe.stat().st_mtime >= newest:
+        return exe
+    print(f"compiling {EXTRACT_HOST_SRC.name} (rustc +stable) ...")
+    try:
+        subprocess.run(
+            ["rustc", "+stable", "--edition", "2021", "-O",
+             str(EXTRACT_HOST_SRC), "-o", str(exe)],
+            check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "rustc not found — laptop feature extraction needs a Rust toolchain "
+            "(run the build in WSL, or `rustup toolchain install stable`)"
+        )
+    return exe
+
+
+def extract_features_host(work: Path, w: int, h: int, note) -> None:
+    """Run the S3's own extractor on every raw/<IMG>.bit -> features/<IMG>.csv."""
+    exe = ensure_extract_host(work)
+    note(f"laptop feature extraction: {w}x{h}, same Rust extractor as the S3")
+    subprocess.run(
+        [str(exe), str(work / "raw"), str(work / "features"), str(w), str(h)],
+        check=True,
+    )
 
 
 # COLMAP camera model name -> on-wire id (must match CAMERA_MODEL_* in

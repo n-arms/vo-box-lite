@@ -13,7 +13,6 @@ mod semantic;
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use esp_idf_hal::delay::FreeRtos;
@@ -24,9 +23,7 @@ use esp_idf_svc::sys::EspError;
 use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, BlockingWifi, Configuration, EspWifi,
 };
-use vo_box_lite::downscale;
-use vo_box_lite::fast;
-use vo_box_lite::pyramid::{self, Feature};
+use vo_box_lite::pyramid;
 use vo_box_lite::rbrief;
 
 /// SoftAP credentials the laptop joins with (WPA2 passphrase must be >= 8 chars).
@@ -58,41 +55,24 @@ const MAX_MAP_POINTS: usize = 100_000;
 const MAGIC: &[u8; 4] = b"VOX2";
 /// esp32-camera PIXFORMAT_GRAYSCALE (the only format we configure).
 const FMT_GRAYSCALE: u8 = 3;
-/// Sensor resolution: the largest grayscale the OV3660 supports. The engine
-/// downsamples 4x4 to `level-0` dims, so the pyramid/upload budget is small
-/// while the capture keeps full sensor detail (see map_frame).
-const CAM_W: usize = 2048;
-const CAM_H: usize = 1536;
+/// Sensor resolution: VGA 640x480 grayscale, streamed raw. No on-device
+/// downscale/pyramid — the laptop runs the same Rust extractor.
+const CAM_W: usize = 640;
+const CAM_H: usize = 480;
 
-/// Monotonic µs clock for the perf logs (`Instant`/esp_timer, anchored at boot
-/// since only deltas matter). A bare fn pointer so it can ride on the no_std
-/// [`pyramid::PyramidProfile`].
-static BOOT_TIME: OnceLock<Instant> = OnceLock::new();
-fn now_us() -> u64 {
-    let boot = *BOOT_TIME.get_or_init(Instant::now);
-    Instant::now().duration_since(boot).as_micros() as u64
-}
-
-/// Entry point: always run the semantic task for now (src/semantic.rs).
+/// Entry point: run the map task (SoftAP + raw VOX2 frame stream).
 fn main() {
-    esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
-    semantic::run();
+    map_mode().expect("map task exited with an error");
 }
 
-/// Previous entry point (SoftAP + feature stream / map upload). Kept intact but
-/// unused while the semantic task is brought up.
+/// Map task: SoftAP + VOX2 frame stream / map upload.
 #[allow(dead_code)]
 fn map_mode() -> Result<(), EspError> {
     // Required once: links the esp-idf runtime patches (esp-idf-template#71).
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    log::info!("=== vo-box-lite: feature stream (QXGA 2048x1536 -> 4x4 -> 512x384 pyramid) ===");
-    log::info!(
-        "downscale_65: {} kernel (pyramid 6:5 downsampling)",
-        if downscale::downscale65_simd_available() { "EE/PIE SIMD" } else { "scalar" }
-    );
+    log::info!("=== vo-box-lite: frame stream (VGA 640x480 raw; laptop extracts) ===");
 
     // ---- SoftAP: WIFI_MODE_AP, no STA ----
     let peripherals = Peripherals::take()?;
@@ -129,7 +109,7 @@ fn map_mode() -> Result<(), EspError> {
 
     // ---- Camera: optional, the TCP server still comes up without it ----
     let camera = match camera::Camera::init(&camera::CameraConfig {
-        frame_size: camera::FrameSize::Qxga, // 2048x1536 gray (CAM_W x CAM_H)
+        frame_size: camera::FrameSize::Vga, // 640x480 gray (CAM_W x CAM_H)
         ..camera::CameraConfig::with_pins(camera::CameraPins::FREENOVE_ESP32S3_WROOM)
     }) {
         Ok(cam) => {
@@ -151,7 +131,7 @@ fn map_mode() -> Result<(), EspError> {
         }
     };
 
-    // ---- TCP server (feature stream: capture + downsample + pyramid + upload) ----
+    // ---- TCP server (frame stream: capture + raw VOX2 upload) ----
     let listener =
         TcpListener::bind((Ipv4Addr::UNSPECIFIED, TCP_PORT)).expect("TCP bind 0.0.0.0:5000 failed");
     log::info!("listening on 0.0.0.0:{TCP_PORT}");
@@ -163,8 +143,8 @@ fn map_mode() -> Result<(), EspError> {
 /// run deadline then sends VOXD; MAPU stores the uploaded map and acks. Either
 /// way the connection is dropped and the next one accepted.
 fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
-    // Pipeline buffers are sized for the downsampled level-0 dims and reused
-    // every frame (no per-frame allocation; see pyramid::extract_pyramid).
+    // Pipeline buffers are sized for the VGA frame dims and reused every frame
+    // (no per-frame allocation).
     let mut pipe: Option<MapPipeline> = None;
     // Last uploaded map; the localize task (not written) will consume it.
     let mut map: Option<LocalMap> = None;
@@ -224,13 +204,13 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
             continue;
         }
 
-        log::info!("starting a {dur_s}s map run for {peer} (frame every {interval_ms} ms)");
+        log::info!(
+            "starting a {dur_s}s frame run for {peer} (frame every {interval_ms} ms; laptop extracts)"
+        );
         let run_start = Instant::now();
         let deadline = run_start + Duration::from_secs(dur_s);
         let mut sent = 0u64;
-        let mut feats_sent = 0u64;
         let mut interrupted = false; // laptop dropped mid-run
-        let mut logged_kernel = false; // one-shot downscale-kernel proof
         while Instant::now() < deadline {
             let frame_start = Instant::now();
             let cam = match camera {
@@ -241,10 +221,7 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                 }
             };
 
-            // One profile per frame: pyramid::extract_pyramid fills the
-            // per-level phase timers (fast/score/nms/blur/rbrief/downscale).
-            let mut prof = pyramid::PyramidProfile::new(now_us);
-            let mut tm = match map_frame(cam, p, &mut prof) {
+            let mut tm = match map_frame(cam, p) {
                 Ok(t) => t,
                 Err(e) => {
                     log::warn!("map_frame failed ({e})");
@@ -252,18 +229,7 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                     continue;
                 }
             };
-            // One-shot first-frame proof that the 6:5 EE kernel ran (not hot-loop).
-            if !logged_kernel {
-                logged_kernel = true;
-                let ds65: u64 = prof.downscale_us.iter().sum();
-                log::info!(
-                    "downscale_65 check: {} compiled; {ds65} us over {} 6:5 levels this frame{}",
-                    if downscale::downscale65_simd_available() { "EE/PIE SIMD" } else { "scalar" },
-                    pyramid::LEVELS - 1,
-                    if downscale::downscale65_simd_used() { "" } else { " [SIMD NOT EXERCISED]" },
-                );
-            }
-            // Send the assembled VOX2 record (downsampled frame + features).
+            // Send the assembled VOX2 record (raw frame, 0 features).
             let t_send = Instant::now();
             let send_max_ms = match send_record(&mut stream, &p.tx) {
                 Ok(v) => v,
@@ -274,9 +240,8 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
             };
             tm.send_us = t_send.elapsed().as_micros() as u64;
             sent += 1;
-            feats_sent += p.last_n as u64;
 
-            // Pace to one frame per `interval_ms` (capture + pyramid + upload
+            // Pace to one frame per `interval_ms` (capture + upload
             // time counts towards the interval; 0 = as fast as possible).
             let wait_ms = interval_ms.saturating_sub(frame_start.elapsed().as_millis() as u64);
             if wait_ms > 0 {
@@ -284,56 +249,31 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
             }
             tm.pace_us = wait_ms * 1000;
 
-            // Debug breakdown (same cadence as before: every frame at a paced
-            // run, every 20th at max rate). All values are µs on one clock.
+            // Debug breakdown (every frame at a paced run, every 20th at max rate).
             if interval_ms > 0 || sent % 20 == 0 {
-                let p_fast = prof.fast_us.iter().sum::<u64>();
-                let p_score = prof.score_us.iter().sum::<u64>();
-                let p_nms = prof.nms_us.iter().sum::<u64>();
-                let p_blur = prof.blur_us.iter().sum::<u64>();
-                let p_rbrief = prof.rbrief_us.iter().sum::<u64>();
-                // rBRIEF phase split (CCOUNT cycles -> us at the 160 MHz clock).
-                let p_ang = prof.rbrief_angle_cyc.iter().sum::<u64>() / 160;
-                let p_smp = prof.rbrief_sample_cyc.iter().sum::<u64>() / 160;
-                let p_ds = prof.downscale_us.iter().sum::<u64>();
-                let p_pyr = p_fast + p_score + p_nms + p_blur + p_rbrief + p_ds;
                 let total_us = frame_start.elapsed().as_micros() as u64;
                 log::info!(
-                    "frame {sent} @ {}s: {} feats — total {total_us} us | capture {} | ds4 {} | \
-                     pyramid {p_pyr} (fast {p_fast} + score {p_score} + nms {p_nms} + blur {p_blur} \
-                     + rbrief {p_rbrief} [angle {p_ang} + sample {p_smp}] + ds65 {p_ds}) | build {} | send {} (max {}ms) | pace {}",
+                    "frame {sent} @ {}s: {}x{} — total {total_us} us | capture {} | build {} | send {} (max {}ms) | pace {}",
                     run_start.elapsed().as_secs(),
-                    p.last_n,
+                    p.w,
+                    p.h,
                     tm.capture_us,
-                    tm.downscale_us,
                     tm.build_us,
                     tm.send_us,
                     send_max_ms,
                     tm.pace_us,
                 );
-                // Per-level pyramid cost (all phases summed) + survivors.
-                let mut per_level = String::from("  per level: ");
-                for l in 0..pyramid::LEVELS {
-                    let ltot = prof.fast_us[l]
-                        + prof.score_us[l]
-                        + prof.nms_us[l]
-                        + prof.blur_us[l]
-                        + prof.rbrief_us[l]
-                        + prof.downscale_us[l];
-                    per_level.push_str(&format!("L{l} {ltot}us/{}feats, ", prof.corners[l]));
-                }
-                log::info!("{per_level}");
             }
         }
 
         if !interrupted {
             // Deadline reached: tell the laptop the run is done, then drop the
-            // connection (it runs COLMAP on the frames it received).
-            build_done_record(&mut p.tx, sent, feats_sent);
+            // connection (the laptop extracts features + runs COLMAP).
+            build_done_record(&mut p.tx, sent, 0);
             if let Err(e) = send_record(&mut stream, &p.tx) {
                 log::warn!("done record send failed ({e})");
             } else {
-                log::info!("map run complete: {sent} frames / {feats_sent} features -> {peer}; VOXD done record sent");
+                log::info!("map run complete: {sent} frames -> {peer}; VOXD done record sent");
             }
         } else {
             log::info!("client {peer} disconnected mid-run after {sent} frames; re-accepting");
@@ -500,9 +440,8 @@ fn read_exact_poll(
     Ok(())
 }
 
-/// Per-frame stage timings (µs, same clock as pyramid): `capture`, `downscale`
-/// (4x4 sensor -> level-0) and `build` (VOX2 assembly); `send`/`pace` come from
-/// the caller, the pyramid phases ride on [`pyramid::PyramidProfile`].
+/// Per-frame stage timings (µs): `capture` and `build` (VOX2 assembly);
+/// `send`/`pace` come from the caller. No device pyramid or downscale runs.
 #[derive(Clone, Copy, Default)]
 struct FrameTimings {
     capture_us: u64,
@@ -512,14 +451,9 @@ struct FrameTimings {
     pace_us: u64,
 }
 
-/// Capture one QXGA frame, 4x4-downsample into level-0 `p.frame`, run the
-/// pyramid (filling `prof`) and assemble the VOX2 record into `p.tx`. Err on
-/// capture/format surprises (dims changed).
-fn map_frame(
-    cam: &camera::Camera,
-    p: &mut MapPipeline,
-    prof: &mut pyramid::PyramidProfile,
-) -> Result<FrameTimings, &'static str> {
+/// Capture one VGA frame, copy it into `p.frame`, and assemble the featureless
+/// VOX2 record into `p.tx`. Err on capture/format surprises (dims changed).
+fn map_frame(cam: &camera::Camera, p: &mut MapPipeline) -> Result<FrameTimings, &'static str> {
     let t_cap = Instant::now();
     let fb = cam.capture().ok_or("capture() returned no frame")?;
     let mut tm = FrameTimings {
@@ -533,36 +467,13 @@ fn map_frame(
     if fb.data().len() != w * h {
         return Err("frame length != w*h (format not grayscale?)");
     }
-    // Capture is full QXGA; the pyramid/laptop see the 4x4 INTER_AREA mean. The
-    // fb is read straight from the driver and returned right away (no full-size
-    // copy) so it can keep capturing while we process.
-    let t_ds = Instant::now();
-    if !downscale::downscale_4x4(fb.data(), w, h, &mut p.frame) {
-        return Err("downscale_4x4 failed (buffer sizes?)");
-    }
-    tm.downscale_us = t_ds.elapsed().as_micros() as u64;
+    // Copy the fb out (fb_count == 1: holding it stops the DMA), then return it
+    // so the camera keeps capturing while we build/send.
+    p.frame.copy_from_slice(fb.data());
     drop(fb);
-
-    let n = pyramid::extract_pyramid(
-        &p.frame,
-        p.w,
-        p.h,
-        pyramid::FAST_THRESHOLD,
-        &mut p.arena,
-        &mut p.work,
-        &mut p.vcol[p.vcol_off..],
-        &mut p.corners,
-        &mut p.scores,
-        &mut p.rowidx,
-        &mut p.nms,
-        &mut p.feats,
-        Some(prof),
-    );
-    p.last_n = n;
-    // Only the first `n` entries are valid (p.feats keeps its full capacity).
-    // build_record measures its own assembly time and embeds it (plus tm's
-    // capture/4x4-downscale and prof's pyramid phases) in the record footer.
-    tm.build_us = build_record(&mut p.tx, p.w, p.h, &p.frame, &p.feats[..n], &tm, prof);
+    // build_record measures its own assembly time and embeds it (plus capture)
+    // in the record footer.
+    tm.build_us = build_record(&mut p.tx, p.w, p.h, &p.frame, &tm);
     Ok(tm)
 }
 
@@ -571,23 +482,13 @@ fn map_frame(
 /// corners}. See build_record + receive_frames.py for the byte layout.
 const VOX2_TIMING_FOOTER_BYTES: usize = 3 * 4 + pyramid::LEVELS * (6 * 4 + 2);
 
-/// Assemble one VOX2 record: length | magic | fmt | w | h | nfeat | pixels |
-/// {level,x,y,desc} per feature | timing footer. Timings ride the WiFi stream
-/// (the console UART wedges at station join); returns the build time in µs.
-fn build_record(
-    buf: &mut Vec<u8>,
-    w: usize,
-    h: usize,
-    frame: &[u8],
-    feats: &[Feature],
-    tm: &FrameTimings,
-    prof: &pyramid::PyramidProfile,
-) -> u64 {
+/// Assemble a featureless VOX2 record (raw frame + timing footer) for the map
+/// run; the laptop extracts features. Timings ride the WiFi stream (the console
+/// UART wedges at station join); returns the build time in µs.
+fn build_record(buf: &mut Vec<u8>, w: usize, h: usize, frame: &[u8], tm: &FrameTimings) -> u64 {
     let t0 = Instant::now();
-    let nfeat = feats.len();
-    // Payload after the u32 length: magic(4) + fmt(1) + w(2) + h(2) + nfeat(2)
-    // + w*h pixels + nfeat * (level 1 + x 4 + y 4 + desc 32) + timing footer.
-    let payload = 11 + w * h + nfeat * 41 + VOX2_TIMING_FOOTER_BYTES;
+    // Payload after the u32 length: magic(4)+fmt(1)+w(2)+h(2)+nfeat(2)+pixels+footer.
+    let payload = 11 + w * h + VOX2_TIMING_FOOTER_BYTES;
 
     buf.clear();
     buf.extend_from_slice(&(payload as u32).to_le_bytes());
@@ -595,31 +496,19 @@ fn build_record(
     buf.push(FMT_GRAYSCALE);
     buf.extend_from_slice(&(w as u16).to_le_bytes());
     buf.extend_from_slice(&(h as u16).to_le_bytes());
-    buf.extend_from_slice(&(nfeat as u16).to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // nfeat: the laptop extracts
     buf.extend_from_slice(frame);
-    for f in feats {
-        buf.push(f.level);
-        buf.extend_from_slice(&f.x.to_le_bytes());
-        buf.extend_from_slice(&f.y.to_le_bytes());
-        for word in f.desc {
-            buf.extend_from_slice(&word.to_le_bytes());
-        }
-    }
-    // Footer (after the features): build_us excludes this append; capture/
-    // downscale came from map_frame, pyramid phases from extract_pyramid. Phase
-    // order must match receive_frames.py's VOX2_FOOTER_FMT ("6IH").
+    // Footer: build_us excludes this append; no device pyramid ran, so the
+    // per-level phase fields are zero (order must match VOX2_FOOTER_FMT).
     let build_us = t0.elapsed().as_micros() as u64;
     buf.extend_from_slice(&(tm.capture_us as u32).to_le_bytes());
     buf.extend_from_slice(&(tm.downscale_us as u32).to_le_bytes());
     buf.extend_from_slice(&(build_us as u32).to_le_bytes());
-    for l in 0..pyramid::LEVELS {
-        buf.extend_from_slice(&(prof.fast_us[l] as u32).to_le_bytes());
-        buf.extend_from_slice(&(prof.score_us[l] as u32).to_le_bytes());
-        buf.extend_from_slice(&(prof.nms_us[l] as u32).to_le_bytes());
-        buf.extend_from_slice(&(prof.blur_us[l] as u32).to_le_bytes());
-        buf.extend_from_slice(&(prof.rbrief_us[l] as u32).to_le_bytes());
-        buf.extend_from_slice(&(prof.downscale_us[l] as u32).to_le_bytes());
-        buf.extend_from_slice(&(prof.corners[l] as u16).to_le_bytes());
+    for _ in 0..pyramid::LEVELS {
+        for _ in 0..6 {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u16.to_le_bytes());
     }
     build_us
 }
@@ -666,78 +555,36 @@ fn send_record(stream: &mut TcpStream, record: &[u8]) -> std::io::Result<u64> {
     Ok(max_ms)
 }
 
-/// Frame-recycled buffers for the feature stream. Sizes are derived from the
-/// level-0 dims (the 4x4-downsampled camera frame); the QXGA fb itself is
-/// driver-owned and never copied. Allocate once (PSRAM), reuse every frame.
+/// Frame-recycled buffers for the frame stream. Sizes derive from the camera
+/// (VGA 640x480); allocate once (PSRAM), reuse every frame.
 struct MapPipeline {
-    /// Expected camera (sensor) frame dims — QXGA 2048x1536.
+    /// Expected camera (sensor) frame dims — VGA 640x480.
     cam_w: usize,
     cam_h: usize,
-    /// Processed level-0 dims after the 4x4 downsample (512x384 at QXGA).
+    /// Level-0 dims == camera dims (no downscale).
     w: usize,
     h: usize,
-    /// 4x-downsampled frame == level 0 of the pyramid == the upload payload.
+    /// Frame copy == the upload payload.
     frame: Vec<u8>,
-    /// Downscaled-level storage (pyramid::extract_pyramid writes levels 1..6
-    /// here, forward, never re-reading a region once its level is processed).
-    arena: Vec<u8>,
-    /// Blur destination / downscale h-pass scratch.
-    work: Vec<u8>,
-    /// Box-blur running column sums (one u16/col). Over-allocated + sliced at
-    /// `vcol_off` so the EE SIMD blur gets its 16-byte-aligned base.
-    vcol: Vec<u16>,
-    /// u16 offset of the aligned start inside `vcol`.
-    vcol_off: usize,
-    /// Per-level RAW FAST corner scratch (candidates before NMS).
-    corners: Vec<fast::Corner>,
-    /// Per-corner FAST scores (>= corners.len() i32s).
-    scores: Vec<i32>,
-    /// NMS row cursors: one usize per level-0 row.
-    rowidx: Vec<usize>,
-    /// NMS survivor store (features are described from here).
-    nms: Vec<fast::Corner>,
-    /// Feature store (first `n` of the last extraction are valid).
-    feats: Vec<Feature>,
     /// Assembled VOX2 record for the last frame.
     tx: Vec<u8>,
-    /// Features in the last extraction (p.feats[..last_n]).
-    last_n: usize,
 }
 
 impl MapPipeline {
-    /// Build the pipeline for camera dims `cam_w` x `cam_h` (level-0 dims are
-    /// those divided by 4 via downscale_4x4_size).
+    /// Build the pipeline for camera dims `cam_w` x `cam_h` (streamed at 1:1).
     fn new(cam_w: usize, cam_h: usize) -> Self {
         assert!(cam_w > 0 && cam_h > 0, "bad camera dims {cam_w}x{cam_h}");
-        let w = downscale::downscale_4x4_size(cam_w);
-        let h = downscale::downscale_4x4_size(cam_h);
-        assert!(w > 0 && h > 0, "camera dims too small to 4x4 downsample");
+        let (w, h) = (cam_w, cam_h);
         let nframe = w * h;
-        let nfeat = pyramid::MAX_FEATURES;
-        // Over-allocate vcol so the blur slice lands on a 16-byte boundary
-        // (align_of::<Vec<u16>>() is 2); misaligned just falls back to scalar.
-        let vcol = vec![0u16; w + 8];
-        let vcol_base = vcol.as_ptr() as usize;
-        let vcol_off = ((16 - (vcol_base & 15)) & 15) / 2;
         MapPipeline {
             cam_w,
             cam_h,
             w,
             h,
             frame: vec![0u8; nframe],
-            arena: vec![0u8; pyramid::arena_bytes(w, h)],
-            work: vec![0u8; nframe],
-            vcol,
-            vcol_off,
-            corners: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
-            scores: vec![0i32; pyramid::CORNERS_RAW_MAX],
-            rowidx: vec![usize::MAX; h], // one per level-0 row (largest level)
-            nms: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
-            feats: vec![Feature::default(); nfeat],
             // Record: length(4) + magic(4) + fmt(1) + w(2) + h(2) + nfeat(2)
-            // + frame + nfeat*41. Slightly over capacity is fine.
-            tx: Vec::with_capacity(15 + nframe + nfeat * 41),
-            last_n: 0,
+            // + frame + footer.
+            tx: Vec::with_capacity(15 + nframe + VOX2_TIMING_FOOTER_BYTES),
         }
     }
 }
