@@ -2,8 +2,14 @@
 //! frames, ends with VOXD) or MAPU (upload a built map + intrinsics; MCU stores
 //! it and idles in localize mode). See scripts/receive_map.py for the protocol.
 
+// The old map/localize entry point is kept but unused while the semantic task
+// (src/semantic.rs) is the startup task.
+#![allow(dead_code)]
+
 #[path = "../camera.rs"]
 mod camera;
+#[path = "../semantic.rs"]
+mod semantic;
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -67,7 +73,17 @@ fn now_us() -> u64 {
     Instant::now().duration_since(boot).as_micros() as u64
 }
 
-fn main() -> Result<(), EspError> {
+/// Entry point: always run the semantic task for now (src/semantic.rs).
+fn main() {
+    esp_idf_svc::sys::link_patches();
+    esp_idf_svc::log::EspLogger::initialize_default();
+    semantic::run();
+}
+
+/// Previous entry point (SoftAP + feature stream / map upload). Kept intact but
+/// unused while the semantic task is brought up.
+#[allow(dead_code)]
+fn map_mode() -> Result<(), EspError> {
     // Required once: links the esp-idf runtime patches (esp-idf-template#71).
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -117,6 +133,15 @@ fn main() -> Result<(), EspError> {
         ..camera::CameraConfig::with_pins(camera::CameraPins::FREENOVE_ESP32S3_WROOM)
     }) {
         Ok(cam) => {
+            // Manual exposure to cut motion blur; AGC auto capped at 64x.
+            // set_gain_ceiling writes the raw gain registers (the driver enum is broken).
+            let aec = cam.set_exposure_ctrl(false);
+            let agc = cam.set_gain_ctrl(true);
+            let aecv = cam.set_aec_value(45);
+            let ceil = cam.set_gain_ceiling(64);
+            log::info!(
+                "camera exposure: manual aec=45, gain auto, ceiling 64x (rets {aec:?}/{agc:?}/{aecv:?}/{ceil:?})"
+            );
             log::info!("camera ready");
             Some(cam)
         }
