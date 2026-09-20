@@ -45,6 +45,126 @@ const FMT_GRAYSCALE: u8 = 3;
 /// ndim(2) + emb_scale(4) + emb_zp(4).
 const EMB_HEADER_BYTES: usize = 19;
 
+/// One-shot calc8 encoder ready to embed frames: mmap'd model partition +
+/// interpreter over a PSRAM arena. The interpreter is a process singleton, so
+/// only one Embedder may exist at a time.
+pub struct Embedder {
+    in_ptr: *mut u8,
+    out_ptr: *const u8,
+    scale: f32,
+    zp: i32,
+    _arena: Vec<u8>,
+    _mmap_handle: sys::esp_partition_mmap_handle_t,
+}
+
+impl Embedder {
+    /// Mmap the `model` partition, build the interpreter and enable per-op
+    /// profiling. Err (instead of idling) so the caller can fall back.
+    pub fn init() -> Result<Embedder, String> {
+        let part = unsafe {
+            sys::esp_partition_find_first(
+                sys::esp_partition_type_t_ESP_PARTITION_TYPE_DATA,
+                MODEL_SUBTYPE,
+                MODEL_LABEL.as_ptr() as *const c_char,
+            )
+        };
+        if part.is_null() {
+            return Err("no 'model' partition (flash the .tflite via cargo_run.sh)".into());
+        }
+        let part_size = unsafe { (*part).size as usize };
+
+        let mut model_ptr: *const c_void = ptr::null();
+        let mut mmap_handle: sys::esp_partition_mmap_handle_t = 0;
+        let e = unsafe {
+            sys::esp_partition_mmap(
+                part,
+                0,
+                part_size,
+                sys::esp_partition_mmap_memory_t_ESP_PARTITION_MMAP_DATA,
+                &mut model_ptr,
+                &mut mmap_handle,
+            )
+        };
+        if e != 0 || model_ptr.is_null() {
+            return Err(format!("model mmap failed ({e})"));
+        }
+        log::info!("semantic: model partition {part_size} B mapped at {model_ptr:p}");
+
+        let mut arena = vec![0u8; ARENA_BYTES];
+        let rc = unsafe {
+            sys::tflite::semantic_model_load(
+                model_ptr as *const u8,
+                part_size,
+                arena.as_mut_ptr(),
+                arena.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!("model load failed rc={rc}: {}", unsafe { last_error() }));
+        }
+
+        let in_size = unsafe { sys::tflite::semantic_input_size() };
+        let in_ptr = unsafe { sys::tflite::semantic_input_data() };
+        let n_out = unsafe { sys::tflite::semantic_output_count() };
+        let out_size = unsafe { sys::tflite::semantic_output_size(0) };
+        let out_ptr = unsafe { sys::tflite::semantic_output_data(0) };
+        let scale = unsafe { sys::tflite::semantic_output_scale(0) };
+        let zp = unsafe { sys::tflite::semantic_output_zero_point(0) };
+        if in_ptr.is_null()
+            || in_size < INPUT_W * INPUT_H
+            || n_out < 1
+            || out_ptr.is_null()
+            || out_size < EMB_DIM
+        {
+            return Err(format!(
+                "unexpected model I/O (input {in_size} B, {n_out} outputs, output {out_size} B)"
+            ));
+        }
+        log::info!(
+            "semantic: model ready — input {in_size} B, output {out_size} B (scale {scale}, zp {zp}), arena {ARENA_BYTES} B"
+        );
+        // Per-op µs breakdown, one line per TFLite op after each invoke.
+        unsafe { sys::tflite::semantic_profile_enable(1) };
+        Ok(Embedder { in_ptr, out_ptr, scale, zp, _arena: arena, _mmap_handle: mmap_handle })
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    pub fn zero_point(&self) -> i32 {
+        self.zp
+    }
+
+    /// Downscale `gray` (`src_w` x `src_h`, 4:1 to the 160x120 model input),
+    /// run one inference and copy the `EMB_DIM` descriptor into `out`.
+    pub fn embed(
+        &mut self,
+        gray: &[u8],
+        src_w: usize,
+        src_h: usize,
+        out: &mut [u8; EMB_DIM],
+    ) -> Result<(), String> {
+        if gray.len() < src_w * src_h {
+            return Err(format!("frame too short ({} B < {src_w}x{src_h})", gray.len()));
+        }
+        if src_w / 4 != INPUT_W || src_h / 4 != INPUT_H {
+            return Err(format!("frame {src_w}x{src_h} does not downscale to {INPUT_W}x{INPUT_H}"));
+        }
+        let input = unsafe { slice::from_raw_parts_mut(self.in_ptr, INPUT_W * INPUT_H) };
+        if !downscale::downscale_4x4(gray, src_w, src_h, input) {
+            return Err("downscale_4x4 failed".into());
+        }
+        let rc = unsafe { sys::tflite::semantic_invoke() };
+        if rc != 0 {
+            return Err(format!("invoke failed rc={rc}: {}", unsafe { last_error() }));
+        }
+        let emb = unsafe { slice::from_raw_parts(self.out_ptr, EMB_DIM) };
+        out.copy_from_slice(emb);
+        Ok(())
+    }
+}
+
 pub fn run() -> ! {
     log::info!(
         "semantic: calc8 int8 encoder on {}x{} grayscale (model from the 'model' flash partition)",
@@ -52,80 +172,15 @@ pub fn run() -> ! {
         INPUT_H
     );
 
-    // `model` is a raw data partition (no filesystem); map it so the flatbuffer
-    // is read in place from flash (no PSRAM copy, matches TFLite-Micro's const
-    // model contract).
-    let part = unsafe {
-        sys::esp_partition_find_first(
-            sys::esp_partition_type_t_ESP_PARTITION_TYPE_DATA,
-            MODEL_SUBTYPE,
-            MODEL_LABEL.as_ptr() as *const c_char,
-        )
+    // `model` is a raw data partition (no filesystem); Embedder maps it in
+    // place from flash and builds the interpreter (no PSRAM model copy).
+    let mut embedder = match Embedder::init() {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("semantic: {e} — idling");
+            idle();
+        }
     };
-    if part.is_null() {
-        log::error!("semantic: no 'model' partition (flash the .tflite via cargo_run.sh) — idling");
-        idle();
-    }
-    let part_size = unsafe { (*part).size as usize };
-
-    let mut model_ptr: *const c_void = ptr::null();
-    let mut mmap_handle: sys::esp_partition_mmap_handle_t = 0;
-    let e = unsafe {
-        sys::esp_partition_mmap(
-            part,
-            0,
-            part_size,
-            sys::esp_partition_mmap_memory_t_ESP_PARTITION_MMAP_DATA,
-            &mut model_ptr,
-            &mut mmap_handle,
-        )
-    };
-    if e != 0 || model_ptr.is_null() {
-        log::error!("semantic: model mmap failed ({e}) — idling");
-        idle();
-    }
-    log::info!("semantic: model partition {part_size} B mapped at {model_ptr:p}");
-
-    let mut arena = vec![0u8; ARENA_BYTES];
-    let rc = unsafe {
-        sys::tflite::semantic_model_load(
-            model_ptr as *const u8,
-            part_size,
-            arena.as_mut_ptr(),
-            arena.len(),
-        )
-    };
-    if rc != 0 {
-        log::error!(
-            "semantic: model load failed rc={rc}: {} — idling",
-            unsafe { last_error() }
-        );
-        idle();
-    }
-
-    let in_size = unsafe { sys::tflite::semantic_input_size() };
-    let in_ptr = unsafe { sys::tflite::semantic_input_data() };
-    let n_out = unsafe { sys::tflite::semantic_output_count() };
-    let out_size = unsafe { sys::tflite::semantic_output_size(0) };
-    let emb_ptr = unsafe { sys::tflite::semantic_output_data(0) };
-    let emb_scale = unsafe { sys::tflite::semantic_output_scale(0) };
-    let emb_zp = unsafe { sys::tflite::semantic_output_zero_point(0) };
-    if in_ptr.is_null()
-        || in_size < INPUT_W * INPUT_H
-        || n_out < 1
-        || emb_ptr.is_null()
-        || out_size < EMB_DIM
-    {
-        log::error!(
-            "semantic: unexpected model I/O (input {in_size} B, {n_out} outputs, output {out_size} B) — idling"
-        );
-        idle();
-    }
-    log::info!(
-        "semantic: model ready — input {in_size} B, output {out_size} B (scale {emb_scale}, zp {emb_zp}), arena {ARENA_BYTES} B"
-    );
-    // Per-op µs breakdown, one line per TFLite op after each invoke.
-    unsafe { sys::tflite::semantic_profile_enable(1) };
 
     // ---- Camera: OV3660 VGA grayscale, captured every tick ----
     let cam = match camera::Camera::init(&camera::CameraConfig {
@@ -242,28 +297,21 @@ pub fn run() -> ! {
             );
             continue;
         }
-        // 4x4-downscale straight into the model input; keep gray bytes for the
-        // wire (fb must be dropped before invoke with fb_count == 1).
+        // Run calc8 (4x4-downscale into the model input + invoke) and keep the
+        // gray bytes for the wire; the fb must be dropped before invoking with
+        // fb_count == 1, so grab both first.
         let t = Instant::now();
-        let input = unsafe { slice::from_raw_parts_mut(in_ptr, INPUT_W * INPUT_H) };
-        if !downscale::downscale_4x4(frame.data(), SRC_W, SRC_H, input) {
-            log::warn!("semantic: downscale_4x4 failed — skipping frame");
-            continue;
-        }
+        let mut emb = [0u8; EMB_DIM];
+        let r = embedder.embed(frame.data(), SRC_W, SRC_H, &mut emb);
         if client.is_some() {
             pix.copy_from_slice(frame.data());
         }
-        let prep_us = t.elapsed().as_micros();
-        drop(frame);
-
-        let t = Instant::now();
-        let rc = unsafe { sys::tflite::semantic_invoke() };
         let infer_us = t.elapsed().as_micros();
+        drop(frame);
         n += 1;
-        if rc != 0 {
+        if let Err(e) = r {
             log::error!(
-                "semantic: invoke {n} failed rc={rc}: {} (cap {cap_us} us, prep {prep_us} us, infer {infer_us} us)",
-                unsafe { last_error() }
+                "semantic: invoke {n} failed: {e} (cap {cap_us} us, infer {infer_us} us)"
             );
             continue;
         }
@@ -271,8 +319,7 @@ pub fn run() -> ! {
 
         let t = Instant::now();
         if client.is_some() {
-            let emb = unsafe { slice::from_raw_parts(emb_ptr, EMB_DIM) };
-            build_emb_frame(&mut tx, &pix, emb, emb_scale, emb_zp);
+            build_emb_frame(&mut tx, &pix, &emb, embedder.scale(), embedder.zero_point());
         }
         let build_us = t.elapsed().as_micros();
         let t = Instant::now();
@@ -290,12 +337,10 @@ pub fn run() -> ! {
 
         // `core` is all on-device compute (capture + downscale + inference);
         // `send` is the network write. No pacing: max throughput.
-        let core_us = cap_us + prep_us + infer_us;
+        let core_us = cap_us + infer_us;
         let total_us = loop_t.elapsed().as_micros().max(1);
         log::info!(
-            "semantic {n}: emb[{EMB_DIM}]{} — core {core_us} us (cap {cap_us} + prep {prep_us} + \
-             infer {infer_us}) | build {build_us} | send {send_us} | total {total_us} us | \
-             period {period_us} us ({:.2} fps)",
+            "semantic {n}: emb[{EMB_DIM}]{} — core {core_us} us (cap {cap_us} + infer {infer_us}) | build {build_us} | send {send_us} | total {total_us} us | period {period_us} us ({:.2} fps)",
             if streamed { " (streamed)" } else { "" },
             1_000_000.0 / period_us as f32,
         );

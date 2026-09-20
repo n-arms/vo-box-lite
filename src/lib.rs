@@ -10,6 +10,8 @@
 pub mod blur;
 pub mod downscale;
 pub mod fast;
+pub mod localize;
+pub mod matcher;
 pub mod pyramid;
 pub mod ranac;
 pub mod rbrief;

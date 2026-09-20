@@ -124,6 +124,14 @@ pub struct PnpResult {
     pub mean_reproj_error_px: f32,
 }
 
+/// Best RANSAC hypothesis stats, filled by [`pnp_ransac_best`] even when the
+/// pose is rejected (0 = no usable hypothesis at all).
+#[derive(Clone, Copy, Default)]
+pub struct PnpBest {
+    pub inlier_count: usize,
+    pub mean_reproj_error_px: f32,
+}
+
 #[derive(Clone, Copy)]
 struct Pose {
     r: [[f32; 3]; 3],
@@ -448,6 +456,228 @@ fn pose_from_p(p: &[f32; 12]) -> Option<Pose> {
     Some(Pose { r, t })
 }
 
+// ------------------------------------------------------------ refine -----
+
+#[inline]
+fn mat_mul3(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut r = [[0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    r
+}
+
+/// Rodrigues `exp([w]x)` with a clamped small-angle Taylor series (no libm):
+/// accurate to O(t^6) for the t <= 0.5 steps LM produces.
+fn exp_so3(w0: [f32; 3]) -> [[f32; 3]; 3] {
+    let mut w = w0;
+    let mut t2 = dot3(w, w);
+    if t2 > 0.25 {
+        let s = 0.5 / sqrt_f32(t2);
+        w = [w[0] * s, w[1] * s, w[2] * s];
+        t2 = 0.25;
+    }
+    let sa = 1.0 - t2 / 6.0 + t2 * t2 / 120.0; // sin(t)/t
+    let ca = 0.5 - t2 / 24.0 + t2 * t2 / 720.0; // (1 - cos t)/t^2
+    let wx = [[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]];
+    let wx2 = mat_mul3(wx, wx);
+    let mut r = [[0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i][j] = (if i == j { 1.0 } else { 0.0 }) + sa * wx[i][j] + ca * wx2[i][j];
+        }
+    }
+    r
+}
+
+/// Solve the 6x6 SPD system `a x = b` by Cholesky. None if not PD / non-finite.
+fn solve6(a: &[[f32; 6]; 6], b: [f32; 6]) -> Option<[f32; 6]> {
+    let mut l = [[0f32; 6]; 6];
+    for i in 0..6 {
+        for j in 0..=i {
+            let mut s = a[i][j];
+            for k in 0..j {
+                s -= l[i][k] * l[j][k];
+            }
+            if i == j {
+                if !(s > 0.0) || !s.is_finite() {
+                    return None;
+                }
+                l[i][i] = sqrt_f32(s);
+            } else {
+                l[i][j] = s / l[j][j];
+            }
+        }
+    }
+    let mut y = [0f32; 6];
+    for i in 0..6 {
+        let mut s = b[i];
+        for k in 0..i {
+            s -= l[i][k] * y[k];
+        }
+        y[i] = s / l[i][i];
+    }
+    let mut x = [0f32; 6];
+    for i in (0..6).rev() {
+        let mut s = y[i];
+        for k in (i + 1)..6 {
+            s -= l[k][i] * x[k];
+        }
+        x[i] = s / l[i][i];
+    }
+    x.iter().all(|v| v.is_finite()).then_some(x)
+}
+
+/// Levenberg-Marquardt refinement of `pose` against `corrs` (optionally only
+/// the entries where `use_mask[i]`), minimizing normalized reprojection error.
+/// Left-multiplied so(3) increment; returns the input if no step improves.
+fn refine_pose(mut pose: Pose, corrs: &[Correspondence], use_mask: Option<&[bool]>) -> Pose {
+    const MAX_IT: usize = 8;
+    let mut used = 0usize;
+    let mut cost = 0f32;
+    for (i, c) in corrs.iter().enumerate() {
+        if use_mask.map_or(false, |m| !m.get(i).copied().unwrap_or(false)) {
+            continue;
+        }
+        used += 1;
+        let xc = rot_vec(&pose.r, c.world);
+        let z = xc[2] + pose.t[2];
+        if z <= 1e-6 {
+            cost += 1e6;
+            continue;
+        }
+        let dx = c.xn - (xc[0] + pose.t[0]) / z;
+        let dy = c.yn - (xc[1] + pose.t[1]) / z;
+        cost += dx * dx + dy * dy;
+    }
+    if used < 4 {
+        return pose;
+    }
+    let mut lambda = 1e-3f32;
+    for _ in 0..MAX_IT {
+        // Normal equations of the per-point 2x6 Jacobian.
+        let mut a = [[0f32; 6]; 6];
+        let mut g = [0f32; 6];
+        for (i, c) in corrs.iter().enumerate() {
+            if use_mask.map_or(false, |m| !m.get(i).copied().unwrap_or(false)) {
+                continue;
+            }
+            let xc = rot_vec(&pose.r, c.world);
+            let x = xc[0] + pose.t[0];
+            let y = xc[1] + pose.t[1];
+            let z = xc[2] + pose.t[2];
+            if z <= 1e-6 {
+                continue;
+            }
+            let iz = 1.0 / z;
+            let px = x * iz;
+            let py = y * iz;
+            // d p/d theta = (d p/d Xc)(-[Xc]x), d p/d t = d p/d Xc.
+            let j0 = [
+                -px * iz * xc[1],
+                iz * z + px * iz * xc[0],
+                -iz * xc[1],
+                iz,
+                0.0,
+                -px * iz,
+            ];
+            let j1 = [
+                -iz * z - py * iz * xc[1],
+                py * iz * xc[0],
+                iz * xc[0],
+                0.0,
+                iz,
+                -py * iz,
+            ];
+            let r = [c.xn - px, c.yn - py];
+            for row in 0..2 {
+                let j = if row == 0 { j0 } else { j1 };
+                for c0 in 0..6 {
+                    g[c0] += j[c0] * r[row];
+                    for c1 in 0..6 {
+                        a[c0][c1] += j[c0] * j[c1];
+                    }
+                }
+            }
+        }
+        let mut accepted = false;
+        for _ in 0..6 {
+            let mut m = a;
+            let mut floor = 1e-12f32;
+            for i in 0..6 {
+                floor = floor.max(a[i][i].abs() * 1e-6);
+            }
+            for i in 0..6 {
+                m[i][i] += lambda * a[i][i].abs().max(floor) + floor;
+            }
+            if let Some(d) = solve6(&m, g) {
+                let cand = Pose {
+                    r: mat_mul3(exp_so3([d[0], d[1], d[2]]), pose.r),
+                    t: [pose.t[0] + d[3], pose.t[1] + d[4], pose.t[2] + d[5]],
+                };
+                let mut cc = 0f32;
+                for (i, c) in corrs.iter().enumerate() {
+                    if use_mask.map_or(false, |mm| !mm.get(i).copied().unwrap_or(false)) {
+                        continue;
+                    }
+                    let xc = rot_vec(&cand.r, c.world);
+                    let z = xc[2] + cand.t[2];
+                    if z <= 1e-6 {
+                        cc += 1e6;
+                        continue;
+                    }
+                    let dx = c.xn - (xc[0] + cand.t[0]) / z;
+                    let dy = c.yn - (xc[1] + cand.t[1]) / z;
+                    cc += dx * dx + dy * dy;
+                }
+                if cc < cost {
+                    pose = cand;
+                    cost = cc;
+                    lambda = (lambda * 0.3).max(1e-6);
+                    accepted = true;
+                    break;
+                }
+            }
+            lambda = (lambda * 3.0).min(1e6);
+        }
+        if !accepted {
+            break;
+        }
+    }
+    pose
+}
+
+/// Inlier mask + (count, sum of squared inlier reproj error in px^2) for a pose.
+fn mask_and_error(
+    pose: &Pose,
+    corrs: &[Correspondence],
+    cam: &Camera,
+    thr2: f32,
+    out_mask: &mut [bool],
+) -> (usize, f32) {
+    let mut fcnt = 0;
+    let mut ferr2 = 0f32;
+    for (i, c) in corrs.iter().enumerate() {
+        let xc = rot_vec(&pose.r, c.world);
+        let z = xc[2] + pose.t[2];
+        let mut inl = false;
+        if z > 0.0 {
+            let du = cam.fx * (c.xn - (xc[0] + pose.t[0]) / z);
+            let dv = cam.fy * (c.yn - (xc[1] + pose.t[1]) / z);
+            let d2 = du * du + dv * dv;
+            inl = d2 <= thr2;
+            if inl {
+                fcnt += 1;
+                ferr2 += d2;
+            }
+        }
+        out_mask[i] = inl;
+    }
+    (fcnt, ferr2)
+}
+
 // -------------------------------------------------------------- RANSAC -----
 
 /// Count pose inliers in undistorted pixel space (`Z_c <= 0` never counts).
@@ -501,6 +731,20 @@ pub fn pnp_ransac(
     rng: &mut impl Rng,
     out_mask: &mut [bool],
 ) -> Option<PnpResult> {
+    let mut best = PnpBest::default();
+    pnp_ransac_best(corrs, cam, opts, rng, out_mask, &mut best)
+}
+
+/// Like [`pnp_ransac`], but also reports the best hypothesis found even when
+/// the pose is rejected (< `min_inliers`) — diagnostics only.
+pub fn pnp_ransac_best(
+    corrs: &[Correspondence],
+    cam: &Camera,
+    opts: &PnpOptions,
+    rng: &mut impl Rng,
+    out_mask: &mut [bool],
+    out_best: &mut PnpBest,
+) -> Option<PnpResult> {
     let n = corrs.len();
     if n < 6 || out_mask.len() < n {
         return None;
@@ -517,6 +761,15 @@ pub fn pnp_ransac(
         let Some(pose) = dlt_pose(corrs, &sample[..k], rng) else {
             continue;
         };
+        // DLT is only a projective fit; LM-refine on the sample to project it
+        // onto the rigid-pose manifold before scoring (see refine_pose).
+        for b in out_mask[..n].iter_mut() {
+            *b = false;
+        }
+        for &i in &sample[..k] {
+            out_mask[i] = true;
+        }
+        let pose = refine_pose(pose, corrs, Some(out_mask));
         let (cnt, err2) = score_pose(&pose, corrs, cam, thr2);
         let take = match best {
             None => true,
@@ -526,34 +779,29 @@ pub fn pnp_ransac(
             best = Some((pose, cnt, err2));
         }
     }
+    if let Some((_, bc, be)) = best {
+        out_best.inlier_count = bc;
+        out_best.mean_reproj_error_px =
+            if bc > 0 { sqrt_f32(be / bc as f32) } else { 0.0 };
+    }
     let (pose, cnt, _) = best?;
     if cnt < opts.min_inliers {
         return None;
     }
 
-    // Deterministic final pass: inlier mask + mean inlier error.
-    let mut fcnt = 0;
-    let mut ferr2 = 0f32;
-    for (i, c) in corrs.iter().enumerate() {
-        let xc = rot_vec(&pose.r, c.world);
-        let z = xc[2] + pose.t[2];
-        let mut inl = false;
-        if z > 0.0 {
-            let du = cam.fx * (c.xn - (xc[0] + pose.t[0]) / z);
-            let dv = cam.fy * (c.yn - (xc[1] + pose.t[1]) / z);
-            let d2 = du * du + dv * dv;
-            inl = d2 <= thr2;
-            if inl {
-                fcnt += 1;
-                ferr2 += d2;
-            }
-        }
-        out_mask[i] = inl;
-    }
-    debug_assert_eq!(fcnt, cnt);
+    // Re-refine on the full inlier set (the RANSAC winner was only refined on
+    // its sample), then write the deterministic final inlier mask.
+    let (cnt0, _) = mask_and_error(&pose, corrs, cam, thr2, out_mask);
+    let final_pose = if cnt0 >= 4 {
+        let refined = refine_pose(pose, corrs, Some(out_mask));
+        if score_pose(&refined, corrs, cam, thr2).0 >= cnt0 { refined } else { pose }
+    } else {
+        pose
+    };
+    let (fcnt, ferr2) = mask_and_error(&final_pose, corrs, cam, thr2, out_mask);
     Some(PnpResult {
-        r: pose.r,
-        t: pose.t,
+        r: final_pose.r,
+        t: final_pose.t,
         inlier_count: fcnt,
         mean_reproj_error_px: sqrt_f32(ferr2 / fcnt as f32),
     })
@@ -683,6 +931,27 @@ mod tests {
         ]) / norm3(truth.t);
         assert!(rerr < 0.1, "rotation err {rerr} deg");
         assert!(terr < 1e-2, "translation rel err {terr}");
+    }
+
+    #[test]
+    fn refine_recovers_from_perturbation() {
+        // The DLT+Gram-Schmidt pose is only a rough init; refine_pose must pull
+        // it back onto the true rigid pose (the real-data failure mode).
+        let mut rng = Xorshift64::new(11);
+        let (truth, corrs, _) = make_scene(&mut rng, 80, 0.0, 1.0);
+        let perturbed = Pose {
+            r: mat_mul3(exp_so3([0.15, -0.12, 0.10]), truth.r),
+            t: [truth.t[0] + 0.4, truth.t[1] - 0.3, truth.t[2] + 0.5],
+        };
+        let refined = refine_pose(perturbed, &corrs, None);
+        let rerr = rot_err_deg(truth.r, refined.r);
+        let terr = norm3([
+            refined.t[0] - truth.t[0],
+            refined.t[1] - truth.t[1],
+            refined.t[2] - truth.t[2],
+        ]) / norm3(truth.t);
+        assert!(rerr < 0.5, "rot err {rerr} deg");
+        assert!(terr < 0.05, "t rel err {terr}");
     }
 
     #[test]

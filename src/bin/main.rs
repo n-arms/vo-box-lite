@@ -13,7 +13,7 @@ mod camera;
 mod semantic;
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use esp_idf_hal::delay::FreeRtos;
@@ -24,8 +24,12 @@ use esp_idf_svc::sys::EspError;
 use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, BlockingWifi, Configuration, EspWifi,
 };
+use vo_box_lite::fast;
+use vo_box_lite::localize;
+use vo_box_lite::localize::MapPoint;
+use vo_box_lite::matcher;
 use vo_box_lite::pyramid;
-use vo_box_lite::rbrief;
+use vo_box_lite::ranac;
 
 /// SoftAP credentials the laptop joins with (WPA2 passphrase must be >= 8 chars).
 const AP_SSID: &str = "vo-box";
@@ -58,6 +62,10 @@ const EMBEDDING_DIM: usize = 1064;
 const MAX_MAP_FRAMES: usize = 1024;
 /// Sanity cap on uploaded points total (44 B each), across all frames.
 const MAX_MAP_POINTS: usize = 100_000;
+/// Diagnostic: also match each query against the union of ALL map frames, which
+/// isolates embedding retrieval from descriptor/geometry problems. Off by
+/// default; flip on when validating a new map's retrieval (costs an extra PnP).
+const LOCALIZE_DEBUG_ALL_FRAMES: bool = false;
 /// Record magic for frame+features (VOX2).
 const MAGIC: &[u8; 4] = b"VOX2";
 /// esp32-camera PIXFORMAT_GRAYSCALE (the only format we configure).
@@ -153,16 +161,22 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
     // Pipeline buffers are sized for the VGA frame dims and reused every frame
     // (no per-frame allocation).
     let mut pipe: Option<MapPipeline> = None;
-    // Last uploaded map; the localize task (not written) will consume it.
+    // Localize-mode pipeline + the last uploaded map it runs against.
+    let mut localizer: Option<Localizer> = None;
     let mut map: Option<LocalMap> = None;
+    // Connection accepted by the localize loop, handled on the next iteration.
+    let mut pending: Option<(TcpStream, SocketAddr)> = None;
     loop {
-        let (mut stream, peer) = match listener.accept() {
-            Ok(conn) => conn,
-            Err(e) => {
-                log::error!("accept failed: {e}");
-                FreeRtos::delay_ms(500);
-                continue;
-            }
+        let (mut stream, peer) = match pending.take() {
+            Some(conn) => conn,
+            None => match listener.accept() {
+                Ok(conn) => conn,
+                Err(e) => {
+                    log::error!("accept failed: {e}");
+                    FreeRtos::delay_ms(500);
+                    continue;
+                }
+            },
         };
         log::info!("laptop connected: {peer} — waiting for its command");
         match map.as_ref() {
@@ -199,7 +213,34 @@ fn feature_server(listener: TcpListener, camera: Option<&camera::Camera>) -> ! {
                 if let Err(e) = send_record(&mut stream, &p.tx) {
                     log::warn!("map ack send failed ({e})");
                 } else {
-                    log::info!("map stored — localize mode (idle until the next STRT)");
+                    log::info!("map stored — entering localize mode");
+                }
+                drop(stream);
+
+                // Lazy-init the localizer (calc8 embedder + reused buffers) on
+                // the first upload; a failed init leaves the map inert.
+                if localizer.is_none() && camera.is_some() {
+                    match Localizer::new() {
+                        Ok(l) => localizer = Some(l),
+                        Err(e) => {
+                            log::error!("localize init failed ({e}); map stored but inert")
+                        }
+                    }
+                }
+                match (camera, localizer.as_mut()) {
+                    (Some(cam), Some(loc)) => {
+                        let r = run_localize(&listener, cam, map.as_ref().unwrap(), loc);
+                        // run_localize returns with the listener blocking again;
+                        // force it in case it bailed out early.
+                        let _ = listener.set_nonblocking(false);
+                        match r {
+                            Ok(conn) => pending = Some(conn),
+                            Err(e) => log::warn!("localize accept failed ({e})"),
+                        }
+                    }
+                    _ => {
+                        log::warn!("no camera/model — idling until the next command")
+                    }
                 }
                 continue;
             }
@@ -314,13 +355,311 @@ struct LocalMap {
 struct LocalMapFrame {
     /// calc8 place-recognition descriptor for this frame.
     embedding: [u8; EMBEDDING_DIM],
-    points: Vec<LocalMapPoint>,
+    /// This frame's triangulated map points (COLMAP xyz + rBRIEF descriptor).
+    points: Vec<MapPoint>,
 }
 
-#[allow(dead_code)] // consumed by the localize task (not written yet)
-struct LocalMapPoint {
-    xyz: [f32; 3],
-    desc: rbrief::Descriptor,
+/// Cosine similarity of two uint8 descriptors; they are unnormalized, so divide
+/// by the norms. Returns 0 for an all-zero vector.
+fn cosine_similarity(a: &[u8], b: &[u8]) -> f32 {
+    let mut dot = 0f32;
+    let mut na = 0f32;
+    let mut nb = 0f32;
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (*x as f32, *y as f32);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom <= f32::EPSILON { 0.0 } else { dot / denom }
+}
+
+/// The K map frames most cosine-similar to `query`, best first, with scores.
+fn top_k_frames<'a>(
+    map: &'a LocalMap,
+    query: &[u8; EMBEDDING_DIM],
+    k: usize,
+) -> Vec<(f32, &'a LocalMapFrame)> {
+    let mut scored: Vec<(f32, &'a LocalMapFrame)> = map
+        .frames
+        .iter()
+        .map(|f| (cosine_similarity(query, &f.embedding), f))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    scored
+}
+
+/// Localize-mode pipeline: the calc8 embedder plus all pyramid / matching / PnP
+/// buffers, allocated once and reused every frame.
+struct Localizer {
+    embedder: semantic::Embedder,
+    arena: Vec<u8>,
+    work: Vec<u8>,
+    vcol: Vec<u16>,
+    corners: Vec<fast::Corner>,
+    scores: Vec<i32>,
+    rowidx: Vec<usize>,
+    nms: Vec<fast::Corner>,
+    feats: Vec<pyramid::Feature>,
+    best_idx: Vec<u32>,
+    best_dist: Vec<u32>,
+    second_dist: Vec<u32>,
+    point_query: Vec<u32>,
+    point_dist: Vec<u32>,
+    matches: Vec<matcher::Match>,
+    corrs: Vec<ranac::Correspondence>,
+    mask: Vec<bool>,
+    frame: Vec<u8>,
+    /// Query calc8 descriptor (kept off the small main-task stack).
+    emb: [u8; EMBEDDING_DIM],
+    rng: ranac::Xorshift64,
+}
+
+impl Localizer {
+    /// Allocate the VGA pipeline + load calc8. Err if the model is missing.
+    fn new() -> Result<Localizer, String> {
+        let (w, h) = (CAM_W, CAM_H);
+        let nf = pyramid::MAX_FEATURES;
+        let np = MAX_MAP_POINTS; // one frame can hold at most the global cap
+        Ok(Localizer {
+            embedder: semantic::Embedder::init()?,
+            arena: vec![0u8; pyramid::arena_bytes(w, h)],
+            work: vec![0u8; w * h],
+            vcol: vec![0u16; w],
+            corners: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
+            scores: vec![0i32; pyramid::CORNERS_RAW_MAX],
+            rowidx: vec![usize::MAX; h],
+            nms: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
+            feats: vec![pyramid::Feature::default(); nf],
+            best_idx: vec![0u32; nf],
+            best_dist: vec![0u32; nf],
+            second_dist: vec![0u32; nf],
+            point_query: vec![0u32; np],
+            point_dist: vec![0u32; np],
+            matches: vec![matcher::Match::default(); nf],
+            corrs: vec![
+                ranac::Correspondence { world: [0.0; 3], xn: 0.0, yn: 0.0 };
+                nf
+            ],
+            mask: vec![false; nf],
+            frame: vec![0u8; w * h],
+            emb: [0u8; EMBEDDING_DIM],
+            rng: ranac::Xorshift64::new(now_us() | 1),
+        })
+    }
+
+    /// Match + PnP the current query features against `points`, reusing buffers.
+    fn localize(
+        &mut self,
+        nfeat: usize,
+        points: &[MapPoint],
+        cam: &ranac::Camera,
+        opts: &ranac::PnpOptions,
+    ) -> localize::LocalizeStats {
+        let mut scratch = localize::LocalizeScratch {
+            mb: matcher::MatchBuffers {
+                best_idx: self.best_idx.as_mut_slice(),
+                best_dist: self.best_dist.as_mut_slice(),
+                second_dist: self.second_dist.as_mut_slice(),
+                point_query: self.point_query.as_mut_slice(),
+                point_dist: self.point_dist.as_mut_slice(),
+            },
+            matches: self.matches.as_mut_slice(),
+            corrs: self.corrs.as_mut_slice(),
+            mask: self.mask.as_mut_slice(),
+        };
+        localize::localize_frame(
+            &self.feats[..nfeat],
+            points,
+            cam,
+            opts,
+            &mut self.rng,
+            &mut scratch,
+            now_us,
+        )
+    }
+}
+
+/// Localize loop: capture VGA -> pyramid FAST+rBRIEF -> calc8 embedding -> top-1
+/// map frame by cosine similarity -> match + PnP RANSAC against that frame's
+/// points. Returns the next laptop connection (which preempts localizing).
+fn run_localize(
+    listener: &TcpListener,
+    cam: &camera::Camera,
+    map: &LocalMap,
+    loc: &mut Localizer,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let cam_model = ranac::Camera {
+        fx: map.params[0],
+        fy: map.params[0],
+        cx: map.params[1],
+        cy: map.params[2],
+        k1: map.params[3],
+    };
+    let opts = ranac::PnpOptions::default();
+    // Non-blocking so a new laptop command can interrupt the localize loop.
+    listener.set_nonblocking(true)?;
+    log::info!(
+        "localize: {} map frames / {} points; running pose estimation",
+        map.frames.len(),
+        map.frames.iter().map(|f| f.points.len()).sum::<usize>()
+    );
+    // Union of every frame's points (diagnostic fallback, see the const above).
+    let all_points: Vec<MapPoint> = if LOCALIZE_DEBUG_ALL_FRAMES {
+        map.frames.iter().flat_map(|f| f.points.iter().copied()).collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut n = 0u64;
+    loop {
+        match listener.accept() {
+            Ok(conn) => {
+                listener.set_nonblocking(false)?;
+                log::info!("localize: laptop reconnected — leaving localize mode");
+                return Ok(conn);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => log::warn!("localize: accept failed ({e})"),
+        }
+
+        let t_cap = Instant::now();
+        let fb = match cam.capture() {
+            Some(f) => f,
+            None => {
+                FreeRtos::delay_ms(20);
+                continue;
+            }
+        };
+        let (w, h) = (fb.width(), fb.height());
+        if (w, h) != (CAM_W, CAM_H) || fb.data().len() != w * h {
+            log::warn!("localize: unexpected frame {w}x{h} ({} B)", fb.data().len());
+            drop(fb);
+            FreeRtos::delay_ms(50);
+            continue;
+        }
+        loc.frame.copy_from_slice(fb.data());
+        let cap_us = t_cap.elapsed().as_micros() as u64;
+        drop(fb);
+
+        // 1) 7-level pyramid FAST-12 + rBRIEF on the full 640x480 frame.
+        let t = Instant::now();
+        let nfeat = pyramid::extract_pyramid(
+            &loc.frame,
+            CAM_W,
+            CAM_H,
+            pyramid::FAST_THRESHOLD,
+            &mut loc.arena,
+            &mut loc.work,
+            &mut loc.vcol,
+            &mut loc.corners,
+            &mut loc.scores,
+            &mut loc.rowidx,
+            &mut loc.nms,
+            &mut loc.feats,
+            None,
+        );
+        let extract_us = t.elapsed().as_micros() as u64;
+
+        // 2) calc8 place-recognition descriptor of the 160x120 downscale.
+        let t = Instant::now();
+        if let Err(e) = loc.embedder.embed(&loc.frame, CAM_W, CAM_H, &mut loc.emb) {
+            log::error!("localize: embed failed ({e})");
+            FreeRtos::delay_ms(50);
+            continue;
+        }
+        let embed_us = t.elapsed().as_micros() as u64;
+
+        // 3) Top-1 map frame by embedding cosine similarity (top-2 for the
+        // margin, a retrieval-confidence diagnostic).
+        let ranked = top_k_frames(map, &loc.emb, 2);
+        let Some(&(cos1, frame)) = ranked.first() else {
+            FreeRtos::delay_ms(50);
+            continue;
+        };
+        let cos2 = ranked.get(1).map_or(0.0, |(s, _)| *s);
+
+        // 4) Match + PnP RANSAC against just that frame's points.
+        let stats = loc.localize(nfeat, &frame.points, &cam_model, &opts);
+        let all_stats = LOCALIZE_DEBUG_ALL_FRAMES
+            .then(|| loc.localize(nfeat, &all_points, &cam_model, &opts));
+        n += 1;
+
+        match stats.pnp {
+            Some(p) => {
+                let (roll, pitch, yaw) = zyx_deg(&p.r);
+                let c = camera_center(&p.r, &p.t);
+                log::info!(
+                    "localize {n}: cos1 {cos1:.3} cos2 {cos2:.3} | feats {nfeat} | matches {} | inliers {} | reproj {:.2}px | roll {roll:.1} pitch {pitch:.1} yaw {yaw:.1} deg | center ({:.2}, {:.2}, {:.2}) | cap {cap_us} extract {extract_us} embed {embed_us} match {} pnp {} us",
+                    stats.matches,
+                    p.inlier_count,
+                    p.mean_reproj_error_px,
+                    c[0], c[1], c[2],
+                    stats.match_us,
+                    stats.pnp_us,
+                );
+            }
+            None => log::info!(
+                "localize {n}: cos1 {cos1:.3} cos2 {cos2:.3} | feats {nfeat} | matches {} | pnp failed (best {} inl, {:.2}px) | cap {cap_us} extract {extract_us} embed {embed_us} match {} pnp {} us",
+                stats.matches,
+                stats.pnp_best.inlier_count,
+                stats.pnp_best.mean_reproj_error_px,
+                stats.match_us,
+                stats.pnp_us,
+            ),
+        }
+        if let Some(a) = all_stats {
+            match a.pnp {
+                Some(p) => log::info!(
+                    "  diag all-frames: matches {} | inliers {} | reproj {:.2}px | match {} pnp {} us",
+                    a.matches, p.inlier_count, p.mean_reproj_error_px, a.match_us, a.pnp_us
+                ),
+                None => log::info!(
+                    "  diag all-frames: matches {} | pnp failed (best {} inl, {:.2}px) | match {} pnp {} us",
+                    a.matches,
+                    a.pnp_best.inlier_count,
+                    a.pnp_best.mean_reproj_error_px,
+                    a.match_us,
+                    a.pnp_us
+                ),
+            }
+        }
+        FreeRtos::delay_ms(1);
+    }
+}
+
+/// Wall-clock microsecond clock for the localize phase timers.
+fn now_us() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// ZYX Euler angles (degrees) of the camera-to-world rotation R_c2w = R_w2c^T:
+/// R_c2w = Rz(yaw) * Ry(pitch) * Rx(roll).
+fn zyx_deg(r_w2c: &[[f32; 3]; 3]) -> (f32, f32, f32) {
+    let r = [
+        [r_w2c[0][0], r_w2c[1][0], r_w2c[2][0]],
+        [r_w2c[0][1], r_w2c[1][1], r_w2c[2][1]],
+        [r_w2c[0][2], r_w2c[1][2], r_w2c[2][2]],
+    ];
+    let pitch = (-r[2][0]).clamp(-1.0, 1.0).asin();
+    let roll = r[2][1].atan2(r[2][2]);
+    let yaw = r[1][0].atan2(r[0][0]);
+    (roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees())
+}
+
+/// Camera center in world coordinates: C = -R_w2c^T * t_w2c.
+fn camera_center(r: &[[f32; 3]; 3], t: &[f32; 3]) -> [f32; 3] {
+    [
+        -(r[0][0] * t[0] + r[1][0] * t[1] + r[2][0] * t[2]),
+        -(r[0][1] * t[0] + r[1][1] * t[1] + r[2][1] * t[2]),
+        -(r[0][2] * t[0] + r[1][2] * t[1] + r[2][2] * t[2]),
+    ]
 }
 
 /// Read the laptop's command (STRT = map run, MAP2 = map upload). Ok(None) on a
@@ -439,7 +778,7 @@ fn read_map_upload(stream: &mut TcpStream, n: usize) -> std::io::Result<LocalMap
             for (w, d) in desc.iter_mut().enumerate() {
                 *d = u32::from_le_bytes(buf[12 + w * 4..16 + w * 4].try_into().unwrap());
             }
-            points.push(LocalMapPoint { xyz, desc });
+            points.push(MapPoint { xyz, desc });
         }
         consumed += EMBEDDING_DIM + 4 + np * 44;
         frames.push(LocalMapFrame { embedding, points });
