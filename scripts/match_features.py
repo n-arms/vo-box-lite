@@ -130,31 +130,36 @@ def match_pair(hexes_a, hexes_b, max_distance=MATCH_MAX_DISTANCE,
 
 
 def match_all(features_dir: Path, max_distance=MATCH_MAX_DISTANCE,
-              lowe_ratio=LOWE_RATIO, use_mnn=USE_MNN):
-    """Match every unordered pair of feature CSVs in `features_dir` (sorted by
-    stem). Returns (rows, stats): rows = [(stem_a, stem_b, idx_a, idx_b,
-    d_best, d_second)] with stem_a < stem_b; stats aggregates per-pair counts."""
+              lowe_ratio=LOWE_RATIO, use_mnn=USE_MNN, pairs=None):
+    """Match feature CSVs in `features_dir` (sorted by stem). `pairs` is an
+    optional iterable of (stem_a, stem_b) to match (either order); None =
+    every unordered pair. Returns (rows, stats): rows = [(stem_a, stem_b,
+    idx_a, idx_b, d_best, d_second)] with stem_a < stem_b; stats aggregates
+    per-pair counts."""
     stems = sorted(p.stem for p in Path(features_dir).glob("*.csv"))
     if len(stems) < 2:
         return [], {"error": f"need >= 2 feature CSVs, found {len(stems)} in {features_dir}"}
     hexes = {s: load_feature_csv(Path(features_dir) / f"{s}.csv") for s in stems}
+    if pairs is None:
+        pair_list = [(stems[i], stems[j])
+                     for i in range(len(stems)) for j in range(i + 1, len(stems))]
+    else:
+        pair_list = sorted((a, b) if a < b else (b, a) for a, b in pairs)
 
     rows = []
     stats = {"pairs_total": 0, "pairs_with_matches": 0,
              "total_matches": 0, "ambiguous": 0, "total_features": 0}
     stats["total_features"] = sum(len(h) for h in hexes.values())
-    for i in range(len(stems)):
-        for j in range(i + 1, len(stems)):
-            sa, sb = stems[i], stems[j]
-            stats["pairs_total"] += 1
-            ms, st = match_pair(hexes[sa], hexes[sb],
-                                max_distance=max_distance,
-                                lowe_ratio=lowe_ratio, use_mnn=use_mnn)
-            if ms:
-                stats["pairs_with_matches"] += 1
-                stats["ambiguous"] += st["ambiguous"]
-            for (ia, ib, db, ds) in ms:
-                rows.append((sa, sb, ia, ib, db, ds))
+    for (sa, sb) in pair_list:
+        stats["pairs_total"] += 1
+        ms, st = match_pair(hexes[sa], hexes[sb],
+                            max_distance=max_distance,
+                            lowe_ratio=lowe_ratio, use_mnn=use_mnn)
+        if ms:
+            stats["pairs_with_matches"] += 1
+            stats["ambiguous"] += st["ambiguous"]
+        for (ia, ib, db, ds) in ms:
+            rows.append((sa, sb, ia, ib, db, ds))
     stats["total_matches"] = len(rows)
     if stats["total_matches"]:
         arr = np.array([r[4] for r in rows])

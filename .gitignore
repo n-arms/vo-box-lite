@@ -42,3 +42,7 @@ out.txt
 
 # Host feature extractor built by receive_map.py
 **/extract_host
+
+/rgbd_dataset_freiburg1_xyz/
+/bench_freiburg1_xyz_md50/
+/bench_freiburg1_xyz/

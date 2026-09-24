@@ -81,6 +81,7 @@ def run_reconstruction(
     matches: List[Tuple[int, int, np.ndarray]],
     max_reproj_error: float = 4.0,
     min_num_inliers: int = 3,
+    refine_intrinsics: bool = True,
     stats: Optional[dict] = None,
 ) -> Dict[int, "pycolmap.Reconstruction"]:
     """Two-view-verify our raw matches (COLMAP's own verifier assumes SIFT), then
@@ -210,6 +211,13 @@ def run_reconstruction(
     options.mapper.random_seed = 0
     # Two-view tracks are the norm at this scale; don't skip triangulating them.
     options.triangulation.ignore_two_view_tracks = False
+    # `refine_intrinsics=False` freezes the calibration supplied in the DB
+    # (focal + radial term) instead of letting BA solve for it.
+    options.ba_refine_focal_length = refine_intrinsics
+    options.ba_refine_principal_point = False
+    options.ba_refine_extra_params = refine_intrinsics
+    options.mapper.abs_pose_refine_focal_length = refine_intrinsics
+    options.mapper.abs_pose_refine_extra_params = refine_intrinsics
 
     # Returns {reconstruction_index: pycolmap.Reconstruction}; more than one
     # entry means the images didn't all merge into a single connected model.
@@ -244,6 +252,7 @@ def reconstruct_feature_positions(
     camera_params: Optional[np.ndarray] = None,
     single_camera: bool = True,
     min_num_inliers: int = 3,
+    refine_intrinsics: bool = True,
     stats: Optional[dict] = None,
 ) -> Dict[Tuple[int, int], np.ndarray]:
     """Top level: build the DB, reconstruct, and map each triangulated 3D point
@@ -268,6 +277,7 @@ def reconstruct_feature_positions(
     reconstructions = run_reconstruction(
         db_path, image_dir, sparse_dir, id_map, features, matches,
         max_reproj_error=4.0, min_num_inliers=min_num_inliers,
+        refine_intrinsics=refine_intrinsics,
         stats=stats,
     )
 

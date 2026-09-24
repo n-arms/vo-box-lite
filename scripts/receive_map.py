@@ -6,6 +6,7 @@ map_report.txt (match -> COLMAP). --rebuild: no ESP.
 """
 
 import argparse
+import json
 import shutil
 import socket
 import struct
@@ -27,6 +28,12 @@ MIN_FRAME_POINTS = 8   # a map frame needs this many triangulated points (PnP mi
 # `rustc +stable` (no cargo / no ESP deps) and run over the raw/ frames. It
 # #[path]-includes the exact S3 source modules, so the descriptors are identical.
 EXTRACT_HOST_SRC = Path(__file__).resolve().parent / "extract_host.rs"
+
+# Rust matcher (scripts/matcher/): rayon + AVX2, byte-identical to
+# match_features.py but ~100x faster. Built with cargo (+stable) + an explicit
+# host --target (the repo's .cargo/config.toml targets xtensa for the ESP).
+MATCHER_CRATE = Path(__file__).resolve().parent / "matcher"
+MATCHER_EXE = MATCHER_CRATE / "target" / "x86_64-unknown-linux-gnu" / "release" / "vo-matcher"
 
 
 def fresh_dirs(work: Path) -> None:
@@ -130,7 +137,8 @@ def build_from_work(work: Path, args) -> int:
         with Image.open(bmp_files[0]) as im:
             fw, fh = im.size
         try:
-            extract_features_host(work, fw, fh, note)
+            extract_features_host(work, fw, fh, note,
+                                  getattr(args, "threshold", None))
         except RuntimeError as e:
             print(f"!! {e}", file=sys.stderr)
             return 1
@@ -163,6 +171,31 @@ def build_from_work(work: Path, args) -> int:
               f"move it while the run streams.", file=sys.stderr)
         return 1
 
+    # ---- 1b. KLT keyframe selection (opt-in: bench --keyframes) ------------
+    # Non-keyframes are dropped entirely (bmp + features unlinked): COLMAP
+    # never sees them and no map points come from them.
+    if getattr(args, "keyframes", False):
+        import keyframes as kf
+        keys, kinfo = kf.select_keyframes(
+            bmps, usable,
+            drift_px=getattr(args, "klt_drift", kf.DEFAULT_DRIFT_PX),
+            min_tracked=getattr(args, "klt_min_tracked", kf.DEFAULT_MIN_TRACKED))
+        for s in usable:
+            if s not in set(keys):
+                for p in (bmps / f"{s}.bmp", features / f"{s}.csv"):
+                    p.unlink(missing_ok=True)
+        bmp_files = sorted(bmps.glob("IMG*.bmp"))
+        usable = keys
+        note(f"keyframes: {len(keys)} kept (KLT drift >= "
+             f"{getattr(args, 'klt_drift', kf.DEFAULT_DRIFT_PX):g}px or tracked < "
+             f"{getattr(args, 'klt_min_tracked', kf.DEFAULT_MIN_TRACKED)})")
+        for (s, reason, n_ok, drift) in kinfo:
+            note(f"  {s}: {reason}")
+        if len(usable) < MIN_USABLE_FRAMES:
+            print(f"only {len(usable)} keyframe(s) (need >= {MIN_USABLE_FRAMES}) — "
+                  f"lower --klt-drift / --klt-min-tracked.", file=sys.stderr)
+            return 1
+
     # dims: all frames in one run share them (loader cross-checks)
     from PIL import Image
     dims = {}
@@ -182,20 +215,62 @@ def build_from_work(work: Path, args) -> int:
     note(f"features/frame: median {int(np.median(fs))}, min {int(fs.min())} "
          f"({lo[0]}), max {int(fs.max())}; total {int(fs.sum())}")
 
-    # ---- 1. cross-image matching -------------------------------------------
+    # ---- 1c. offline calc8 place-recognition embeddings --------------------
+    # One 1064-B descriptor per frame with the device-identical preprocessing
+    # (truncating 4x4 block mean -> 160x120). Runs BEFORE matching: the
+    # candidate pairs below need them, and map assembly reuses them.
+    import embed_host
     t0 = time.time()
-    rows, mstats = mf.match_all(features)
+    try:
+        embs = embed_host.compute_embeddings(bmp_files)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"!! embedding failed: {e}", file=sys.stderr)
+        return 1
+    emb_dir = work / "embeddings"
+    emb_dir.mkdir(exist_ok=True)
+    for stem, b in embs.items():
+        np.save(emb_dir / f"{stem}.npy", np.frombuffer(b, dtype=np.uint8))
+    note(f"embeddings: {len(embs)} frames @ {embed_host.EMB_DIM} B "
+         f"({time.time()-t0:.1f}s, calc8 offline)")
+
+    # ---- 2. cross-image matching (Rust: rayon + AVX2) ----------------------
+    # With keyframes, only the candidate pairs are matched (temporal window +
+    # top-k embedding neighbours, both causal); otherwise every pair.
+    t0 = time.time()
+    max_distance = getattr(args, "max_distance", mf.MATCH_MAX_DISTANCE)
+    lowe_ratio = getattr(args, "lowe_ratio", mf.LOWE_RATIO)
+    cand_pairs = None
+    if getattr(args, "keyframes", False):
+        import keyframes as kf
+        window = getattr(args, "match_window", kf.DEFAULT_WINDOW)
+        topk = getattr(args, "match_topk", kf.DEFAULT_TOPK)
+        cand_pairs = sorted(kf.candidate_pairs(usable, embs,
+                                                window=window, topk=topk))
+        note(f"candidate pairs: {len(cand_pairs)} ({window}-frame window + "
+             f"top-{topk} embedding)")
+        if not cand_pairs:
+            print("no candidate pairs — need >= 2 keyframes with a nonzero "
+                  "window/topk.", file=sys.stderr)
+            return 1
+    try:
+        mstats = match_features_rust(work, features, max_distance, lowe_ratio,
+                                      pairs=cand_pairs)
+    except RuntimeError as e:
+        # No rust toolchain: the numpy matcher is byte-identical, just slower.
+        print(f"!! {e} — falling back to the numpy matcher", file=sys.stderr)
+        rows, mstats = mf.match_all(features, max_distance=max_distance,
+                                    lowe_ratio=lowe_ratio, pairs=cand_pairs)
+        mf.write_matches_csv(work / "matches.csv", rows)
     if mstats.get("error"):
         print(f"matching failed: {mstats['error']}", file=sys.stderr)
         return 1
-    mf.write_matches_csv(work / "matches.csv", rows)
     note(f"matching: {mstats['total_matches']} matches across "
          f"{mstats['pairs_with_matches']}/{mstats['pairs_total']} pairs "
          f"({time.time()-t0:.1f}s)")
     if mstats["total_matches"]:
         note(f"  best-match Hamming dist: min {mstats['match_dist_min']}, "
              f"median {mstats['match_dist_median']}, max {mstats['match_dist_max']}")
-        note(f"  ambiguous matches (2nd candidate also within 100 bits): "
+        note(f"  ambiguous matches (2nd candidate also within {max_distance} bits): "
              f"{mstats['ambiguous']} ({100*mstats['ambiguous_frac']:.1f}%)")
     if mstats["pairs_with_matches"] == 0:
         print("no image pair matched at all — nothing for COLMAP. Lower "
@@ -203,7 +278,7 @@ def build_from_work(work: Path, args) -> int:
               file=sys.stderr)
         return 1
 
-    # ---- 2. COLMAP reconstruction ------------------------------------------
+    # ---- 3. COLMAP reconstruction ------------------------------------------
     stats = {}
     try:
         images, features_map, matches = colmap_map.load_images_features_matches(
@@ -214,6 +289,8 @@ def build_from_work(work: Path, args) -> int:
             images, features_map, matches,
             image_dir=str(bmps),
             workdir=str(work / "colmap_work"),
+            camera_params=getattr(args, "camera_params", None),
+            refine_intrinsics=getattr(args, "refine_intrinsics", True),
             stats=stats,
         )
     except Exception as e:  # colmap_map raises RuntimeError/ValueError/...
@@ -235,25 +312,7 @@ def build_from_work(work: Path, args) -> int:
     note(f"COLMAP: verified {stats.get('pairs_verified', '?')}/{len(matches)} "
          f"image pairs; triangulated {len(positions)}/{total_features} features")
 
-    # ---- 2b. offline calc8 place-recognition embeddings --------------------
-    # One 1064-B descriptor per frame with the device-identical preprocessing
-    # (truncating 4x4 block mean -> 160x120), so map frames can be selected by
-    # place without rerunning the encoder.
-    import embed_host
-    t0 = time.time()
-    try:
-        embs = embed_host.compute_embeddings(bmp_files)
-    except (FileNotFoundError, ValueError) as e:
-        print(f"!! embedding failed: {e}", file=sys.stderr)
-        return 1
-    emb_dir = work / "embeddings"
-    emb_dir.mkdir(exist_ok=True)
-    for stem, b in embs.items():
-        np.save(emb_dir / f"{stem}.npy", np.frombuffer(b, dtype=np.uint8))
-    note(f"embeddings: {len(embs)} frames @ {embed_host.EMB_DIM} B "
-         f"({time.time()-t0:.1f}s, calc8 offline)")
-
-    # ---- 3. map.txt + quality report ---------------------------------------
+    # ---- 4. map.txt + quality report ---------------------------------------
     try:
         summary = write_map.build_map_file(
             work / "colmap_work", features, work / "map.txt",
@@ -314,14 +373,59 @@ def ensure_extract_host(work: Path) -> Path:
     return exe
 
 
-def extract_features_host(work: Path, w: int, h: int, note) -> None:
-    """Run the S3's own extractor on every raw/<IMG>.bit -> features/<IMG>.csv."""
+def extract_features_host(work: Path, w: int, h: int, note,
+                          threshold=None) -> None:
+    """Run the S3's own extractor on every raw/<IMG>.bit -> features/<IMG>.csv.
+    `threshold` overrides pyramid::FAST_THRESHOLD (the extractor's default)."""
     exe = ensure_extract_host(work)
-    note(f"laptop feature extraction: {w}x{h}, same Rust extractor as the S3")
-    subprocess.run(
-        [str(exe), str(work / "raw"), str(work / "features"), str(w), str(h)],
-        check=True,
-    )
+    note(f"laptop feature extraction: {w}x{h}, same Rust extractor as the S3"
+         + (f", FAST threshold {threshold}" if threshold else ""))
+    cmd = [str(exe), str(work / "raw"), str(work / "features"), str(w), str(h)]
+    if threshold:
+        cmd.append(str(threshold))
+    subprocess.run(cmd, check=True)
+
+
+def ensure_matcher() -> Path:
+    """Build the rayon+AVX2 matcher crate (stable host toolchain) if stale.
+    Raises RuntimeError if cargo is unavailable (caller falls back to numpy)."""
+    newest = (MATCHER_CRATE / "Cargo.toml").stat().st_mtime
+    for p in (MATCHER_CRATE / "src").rglob("*.rs"):
+        newest = max(newest, p.stat().st_mtime)
+    if MATCHER_EXE.exists() and MATCHER_EXE.stat().st_mtime >= newest:
+        return MATCHER_EXE
+    print("compiling vo-matcher (cargo +stable, release) ...")
+    try:
+        subprocess.run(
+            ["cargo", "+stable", "build", "--release",
+             "--target", "x86_64-unknown-linux-gnu"],
+            cwd=MATCHER_CRATE, check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "cargo not found — the Rust matcher needs a Rust toolchain "
+            "(run the build in WSL, or `rustup toolchain install stable`)"
+        )
+    return MATCHER_EXE
+
+
+def match_features_rust(work: Path, features: Path, max_distance,
+                        lowe_ratio, pairs=None) -> dict:
+    """Run the Rust matcher -> <work>/matches.csv + stats dict (same images /
+    pair ordering / semantics as match_features.match_all). `pairs` is an
+    optional list of (stem_a, stem_b) to match; None = every pair."""
+    exe = ensure_matcher()
+    stats_path = work / "matches_stats.json"
+    cmd = [str(exe), str(features), str(work / "matches.csv"), str(stats_path),
+           str(max_distance), str(lowe_ratio)]
+    if pairs is not None:
+        pairs_path = work / "candidate_pairs.csv"
+        with open(pairs_path, "w") as f:
+            for (a, b) in pairs:
+                f.write(f"{a},{b}\n")
+        cmd.append(str(pairs_path))
+    subprocess.run(cmd, check=True)
+    return json.loads(stats_path.read_text())
 
 
 # COLMAP camera model name -> on-wire id (must match CAMERA_MODEL_* in
