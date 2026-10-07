@@ -136,9 +136,12 @@ fn parse_args() -> Opts {
         r_pos: R_POS_VAR,
         r_att: R_ATT_VAR,
         r_vel: R_VEL_VAR,
-        min_inliers: 50,
-        max_vo_speed: 1.0,
-        max_att_resid_deg: 30.0,
+        // Fix-rejection gates off by default: the firmware has no gating, and
+        // absolute inlier counts are regime-dependent (a 1 s fix with 28
+        // inliers is good; a 5 s outlier has ~10). Opt in via the flags.
+        min_inliers: 0,
+        max_vo_speed: 0.0,
+        max_att_resid_deg: 0.0,
         fuse_attitude: true,
         reopen_ba_at: 0,
         reopen_ba_std: 0.5,
@@ -722,9 +725,9 @@ impl Harness {
             r_pos: R_POS_VAR,
             r_att: R_ATT_VAR,
             r_vel: R_VEL_VAR,
-            min_inliers: 50,
-            max_vo_speed: 1.0,
-            max_att_resid_deg: 30.0,
+            min_inliers: 0,
+            max_vo_speed: 0.0,
+            max_att_resid_deg: 0.0,
             fuse_attitude: true,
             prev_fix: None,
             n_accept: 0,

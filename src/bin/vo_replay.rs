@@ -139,6 +139,7 @@ const INIT_MAGIC: [u8; 4] = *b"INIT";
 // EKF fusion tuning (TUNE(BENCH_VI): refine vs EuRoC groundtruth alignment).
 const R_POS_VAR: f32 = 0.01; // (0.1 m)^2 VO-fix position variance
 const R_ATT_VAR: f32 = 0.002; // (~2.6 deg)^2 VO-fix attitude variance
+const R_VEL_VAR: f32 = 0.01; // (0.1 m/s)^2 VO-differenced velocity variance
 const GAP_RESYNC_US: u64 = 500_000; // IMU time gap -> re-anchor, skip predict
 // TODO(BENCH_VI): fill the EuRoC cam0<-IMU extrinsic; identity treats the
 // camera and IMU frames as one, so the EKF state is the camera body frame.
@@ -653,6 +654,8 @@ fn link_loop(
     let mut imu_buf: Vec<ImuSample> = Vec::new();
     // Set once the first VO fix lands: gates the strong/weak prior choice.
     let mut ekf_initialized = false;
+    // (t_img, camera center) of the last fix: source of the velocity pseudo.
+    let mut prev_fix: Option<(u64, [f32; 3])> = None;
     log::info!("ekf init: origin/identity, wide P0; first VO fix snaps it in");
     loop {
         // A finished fix (arrived while IMU kept flowing) is applied first:
@@ -666,6 +669,7 @@ fn link_loop(
                 &mut n,
                 n_imu,
                 &mut ekf_initialized,
+                &mut prev_fix,
                 &msg,
             );
             imu_since_log = 0;
@@ -805,6 +809,7 @@ fn apply_fix(
     n: &mut u64,
     n_imu: u64,
     initialized: &mut bool,
+    prev_fix: &mut Option<(u64, [f32; 3])>,
     msg: &VoMsg,
 ) {
     let Some((s_ekf, s_t, t_img)) = snap.take() else {
@@ -827,6 +832,28 @@ fn apply_fix(
     });
     if matches!(corr, Some(Some(_))) {
         *initialized = true;
+    }
+    // Velocity pseudo-measurement: finite difference of consecutive VO camera
+    // centers, fused before the buffered IMU replay (harness parity). Skipped
+    // on the first fix / failed fixes / absurd dt.
+    if let Some(p) = msg.pnp {
+        let c = camera_center(&p.r, &p.t);
+        if let Some((t_prev, p_prev)) = *prev_fix {
+            let dt = (msg.t_us.saturating_sub(t_prev)) as f32 / 1e6;
+            if dt >= 0.5 && dt <= 15.0 {
+                let v_meas = [
+                    (c[0] - p_prev[0]) / dt,
+                    (c[1] - p_prev[1]) / dt,
+                    (c[2] - p_prev[2]) / dt,
+                ];
+                let rv = ekf.correct_velocity(v_meas, R_VEL_VAR);
+                log::info!(
+                    "  vel pseudo dt={dt:.1}s meas=({:.2},{:.2},{:.2}) res={rv:?}",
+                    v_meas[0], v_meas[1], v_meas[2]
+                );
+            }
+        }
+        *prev_fix = Some((msg.t_us, c));
     }
     fuse_imu_samples(ekf, ekf_time_us, imu_buf);
     imu_buf.clear();
