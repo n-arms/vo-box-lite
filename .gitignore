@@ -43,6 +43,11 @@ out.txt
 # Host feature extractor built by receive_map.py
 **/extract_host
 
+# BENCH_VI harness artifacts (maps, replays, trajectories, logs, binary)
+/bench_vi/
+# Default manifest written by scripts/send_tum.py
+/sent.csv
+
 /rgbd_dataset_freiburg1_xyz/
 /bench_freiburg1_xyz_md50/
 /bench_freiburg1_xyz/

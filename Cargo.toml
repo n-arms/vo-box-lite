@@ -11,6 +11,21 @@ name = "vo-box-lite"
 path = "./src/bin/main.rs"
 harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
 
+[[bin]]
+name = "data_board"
+path = "./src/bin/data_board.rs"
+harness = false
+
+[[bin]]
+name = "vo_replay"
+path = "./src/bin/vo_replay.rs"
+harness = false
+
+[[bin]]
+name = "bench"
+path = "./src/bin/bench.rs"
+harness = false
+
 [lib]
 name = "vo_box_lite"
 path = "./src/lib.rs"

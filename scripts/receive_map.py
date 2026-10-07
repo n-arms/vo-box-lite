@@ -291,6 +291,7 @@ def build_from_work(work: Path, args) -> int:
             workdir=str(work / "colmap_work"),
             camera_params=getattr(args, "camera_params", None),
             refine_intrinsics=getattr(args, "refine_intrinsics", True),
+            min_num_inliers=getattr(args, "min_num_inliers", 3),
             stats=stats,
         )
     except Exception as e:  # colmap_map raises RuntimeError/ValueError/...

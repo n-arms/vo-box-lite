@@ -48,6 +48,8 @@ fn main() {
     let mut scores = vec![0i32; pyramid::CORNERS_RAW_MAX];
     let mut rowidx = vec![usize::MAX; h];
     let mut nms = vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX];
+    let mut cells = vec![0u32; pyramid::bucket_cells(w, h) * pyramid::BUCKET_K];
+    let mut cand = vec![pyramid::Candidate::default(); pyramid::CAND_MAX];
     let mut out = vec![pyramid::Feature::default(); pyramid::MAX_FEATURES];
 
     let mut raws: Vec<PathBuf> = fs::read_dir(&raw_dir)
@@ -91,6 +93,8 @@ fn main() {
             &mut scores,
             &mut rowidx,
             &mut nms,
+            &mut cells,
+            &mut cand,
             &mut out,
             None,
         );

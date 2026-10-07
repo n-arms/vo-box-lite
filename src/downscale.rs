@@ -1,6 +1,8 @@
-//! Fixed-ratio downsamplers: [`downscale_65`] (6:5, byte-identical to slam-exp's
-//! `downscale_65_sse`) and [`downscale_4x4`] (INTER_AREA-style block mean).
-//! no_std, alloc-free, u16 math, truncating; dst must not alias src/scratch.
+//! Fixed-ratio downsamplers: [`downscale_43`] (4:3, the pyramid ratio),
+//! [`downscale_65`] (6:5, byte-identical to slam-exp's `downscale_65_sse`) and
+//! [`downscale_4x4`] (INTER_AREA-style block mean). no_std, alloc-free, u16
+//! math, truncating; dst must not alias src/scratch. The 4:3/6:5 passes have
+//! EE/PIE SIMD kernels on xtensa with exact scalar tails.
 
 /// Weights for the first (earlier) sample of each output phase.
 const W1: [u16; 5] = [107, 85, 64, 43, 21];
@@ -241,6 +243,179 @@ pub fn downscale_65(
     let h_used = hpass(src, sw, sh, dw, tmp);
     let v_used = vpass(tmp, dw, dh, dst);
     mark_simd_used(h_used | v_used);
+    true
+}
+
+// ---- 4:3 downscale (3 outputs per 4 inputs, two-tap) ----
+
+/// Weights for the first (earlier) sample of each 4:3 output phase.
+const W43_1: [u16; 3] = [128, 85, 43];
+/// Weights for the second (later) sample; out1/out2 interpolate, out0 = in0.
+const W43_2: [u16; 3] = [0, 43, 85];
+
+/// EE tap rows for the 4:3 h-pass. Lane `j` reads `src[i+j]`/`src[i+j+1]`, and
+/// the output phase advances by 4/3, so one EE block covers two 4-px groups:
+/// lanes 0..3 = [out0,out1,out2] of group g then out0 of group g+1, lane 4 is
+/// a don't-care, lanes 5..6 = out1,out2 of group g+1 (lane 7 don't-care).
+static HW43_1: V8 = V8([128, 85, 43, 0, 0, 85, 43, 0]);
+static HW43_2: V8 = V8([0, 43, 85, 128, 0, 43, 85, 0]);
+static VW43_1: [V8; 3] = [V8([128; 8]), V8([85; 8]), V8([43; 8])];
+static VW43_2: [V8; 3] = [V8([0; 8]), V8([43; 8]), V8([85; 8])];
+
+#[cfg(target_arch = "xtensa")]
+static SIMD43_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Latched once any 4:3 EE group runs (one relaxed store per `downscale_43`).
+fn mark_simd43_used(used: bool) {
+    #[cfg(target_arch = "xtensa")]
+    if used {
+        SIMD43_USED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    let _ = used;
+}
+
+/// True once the 4:3 EE kernel has run a group (host always false).
+pub fn downscale43_simd_used() -> bool {
+    #[cfg(target_arch = "xtensa")]
+    {
+        SIMD43_USED.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        false
+    }
+}
+
+/// Output size for one axis of the fixed 4:3 ratio: `3 * (n / 4)`.
+#[inline]
+pub const fn downscale_43_size(n: usize) -> usize {
+    3 * (n / 4)
+}
+
+/// Two-tap weighted average of one 4:3 output phase: `(W1[k]*a + W2[k]*b) >> 7`.
+/// Sum ≤ 255*128 = 32640 fits u16, so it is exact (truncating).
+#[inline(always)]
+fn phase43(k: usize, a: u8, b: u8) -> u8 {
+    ((W43_1[k] * a as u16 + W43_2[k] * b as u16) >> 7) as u8
+}
+
+/// 6 raw byte stores (see `store8`); `x + 6` must be in bounds. The two output
+/// groups sit in lanes [0,1,2,3] (lo u32) and [5,6] (hi bytes 1,2); lanes 4
+/// and 7 of the EE block are don't-cares.
+#[inline(always)]
+fn store6(dst_row: &mut [u8], x: usize, w: [u32; 2]) {
+    let p = dst_row.as_mut_ptr();
+    unsafe {
+        *p.wrapping_add(x) = w[0] as u8;
+        *p.wrapping_add(x + 1) = (w[0] >> 8) as u8;
+        *p.wrapping_add(x + 2) = (w[0] >> 16) as u8;
+        *p.wrapping_add(x + 3) = (w[0] >> 24) as u8;
+        *p.wrapping_add(x + 4) = (w[1] >> 8) as u8;
+        *p.wrapping_add(x + 5) = (w[1] >> 16) as u8;
+    }
+}
+
+/// One scalar 4-px group -> 3 outputs at `o`.
+#[inline(always)]
+fn group43(src: &[u8], i: usize, t: &mut [u8], o: usize) {
+    t[o + 0] = phase43(0, src[i + 0], src[i + 1]);
+    t[o + 1] = phase43(1, src[i + 1], src[i + 2]);
+    t[o + 2] = phase43(2, src[i + 2], src[i + 3]);
+}
+
+/// Horizontal 4:3 pass: src (sw) -> tmp (dw x sh), each 4-px group -> 3 px,
+/// `t[3g+k] = (W1[k]*s[4g+k] + W2[k]*s[4g+k+1]) >> 7`. Two groups per EE block
+/// (6 outputs in lanes 0..3 and 5..6); an odd trailing group and any block
+/// whose 32-byte read window would leave `src` fall back to scalar.
+fn hpass43(src: &[u8], sw: usize, sh: usize, dw: usize, tmp: &mut [u8]) -> bool {
+    let groups = dw / 3; // == sw / 4
+    let start = src.as_ptr() as usize;
+    let end = start + src.len();
+    let mut used = false;
+    for y in 0..sh {
+        let t = &mut tmp[y * dw..];
+        let row = y * sw;
+        let mut g = 0usize;
+        while g + 2 <= groups {
+            let i = row + 4 * g;
+            let o = 3 * g;
+            let pa = start + i;
+            if win_ok(pa, start, end) && win_ok(pa + 1, start, end) {
+                used = true;
+                store6(t, o, simd_pair8(src, i, i + 1, &HW43_1.0, &HW43_2.0));
+            } else {
+                group43(src, i, t, o);
+                group43(src, i + 4, t, o + 3);
+            }
+            g += 2;
+        }
+        // Odd group count: the last group runs scalar (EE blocks need pairs).
+        if g < groups {
+            group43(src, row + 4 * g, t, 3 * g);
+        }
+    }
+    used
+}
+
+/// Vertical 4:3 pass: tmp (strided dw) -> dst, each 4-row block -> 3 rows,
+/// `dst[3b+k][x] = (W1[k]*tmp[4b+k][x] + W2[k]*tmp[4b+k+1][x]) >> 7`. 8 outputs
+/// per EE window pair with the per-phase weight broadcast; scalar edges/tail.
+fn vpass43(tmp: &[u8], dw: usize, dh: usize, dst: &mut [u8]) -> bool {
+    let blocks = dh / 3; // == sh / 4
+    let t0 = tmp.as_ptr() as usize;
+    let t1 = t0 + tmp.len();
+    let mut used = false;
+    for b in 0..blocks {
+        for k in 0..3 {
+            let r0 = (4 * b + k) * dw;
+            let r1 = r0 + dw;
+            let d = &mut dst[(3 * b + k) * dw..(3 * b + k + 1) * dw];
+            let mut x = 0usize;
+            while x + 8 <= dw {
+                if win_ok(t0 + r0 + x, t0, t1) && win_ok(t0 + r1 + x, t0, t1) {
+                    used = true;
+                    store8(d, x, simd_pair8(tmp, r0 + x, r1 + x, &VW43_1[k].0, &VW43_2[k].0));
+                } else {
+                    for j in 0..8 {
+                        d[x + j] = phase43(k, tmp[r0 + x + j], tmp[r1 + x + j]);
+                    }
+                }
+                x += 8;
+            }
+            while x < dw {
+                d[x] = phase43(k, tmp[r0 + x], tmp[r1 + x]);
+                x += 1;
+            }
+        }
+    }
+    used
+}
+
+/// 4:3 downsample src (sw x sh) -> dst (dw x dh) with sizes from the fixed
+/// ratio. `tmp` = caller-owned h-pass scratch (dw x sh u8); dst must not alias
+/// src/tmp. False on invalid sizes; < 4 axis: empty output.
+pub fn downscale_43(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    tmp: &mut [u8],
+    dst: &mut [u8],
+) -> bool {
+    let dw = downscale_43_size(sw);
+    let dh = downscale_43_size(sh);
+    if sw == 0
+        || sh == 0
+        || src.len() < sw * sh
+        || tmp.len() < dw * sh
+        || dst.len() < dw * dh
+    {
+        return false;
+    }
+    // dw/dh == 0 (axis < 4): hpass/vpass have no groups and no-op.
+    let h_used = hpass43(src, sw, sh, dw, tmp);
+    let v_used = vpass43(tmp, dw, dh, dst);
+    mark_simd43_used(h_used | v_used);
     true
 }
 
@@ -504,6 +679,60 @@ mod tests {
         assert_eq!(downscale_65_size(12), 10);
     }
 
+    fn naive_downscale_43(src: &[u8], sw: usize, sh: usize) -> Vec<u8> {
+        let dw = downscale_43_size(sw);
+        let dh = downscale_43_size(sh);
+        let g = sw / 4;
+        let b = sh / 4;
+        let mut tmp = vec![0u8; dw * sh];
+        for y in 0..sh {
+            for gg in 0..g {
+                for k in 0..3 {
+                    let a = src[y * sw + 4 * gg + k] as u32;
+                    let c = src[y * sw + 4 * gg + k + 1] as u32;
+                    tmp[y * dw + 3 * gg + k] =
+                        ((W43_1[k] as u32 * a + W43_2[k] as u32 * c) >> 7) as u8;
+                }
+            }
+        }
+        let mut out = vec![0u8; dw * dh];
+        for bb in 0..b {
+            for k in 0..3 {
+                let y0 = 4 * bb + k;
+                for x in 0..dw {
+                    let a = tmp[y0 * dw + x] as u32;
+                    let c = tmp[(y0 + 1) * dw + x] as u32;
+                    out[(3 * bb + k) * dw + x] =
+                        ((W43_1[k] as u32 * a + W43_2[k] as u32 * c) >> 7) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn downscale_43_sizes_and_naive_reference() {
+        assert_eq!(downscale_43_size(640), 480);
+        assert_eq!(downscale_43_size(480), 360);
+        assert_eq!(downscale_43_size(3), 0);
+        assert_eq!(downscale_43_size(4), 3);
+        assert_eq!(downscale_43_size(7), 3);
+        let sizes: &[(usize, usize)] = &[
+            (4, 4), (4, 5), (5, 4), (7, 7), (8, 8), (11, 13), (64, 48), (640, 480),
+        ];
+        for &(sw, sh) in sizes {
+            let mut rng = Lcg(0x1234_5678 ^ ((sw as u64) << 32) ^ (sh as u64));
+            let mut src = vec![0u8; sw * sh];
+            rng.fill(&mut src);
+            let dw = downscale_43_size(sw);
+            let dh = downscale_43_size(sh);
+            let mut tmp = vec![0xAAu8; dw * sh];
+            let mut dst = vec![0xBBu8; dw * dh];
+            assert!(downscale_43(&src, sw, sh, &mut tmp, &mut dst), "size {sw}x{sh}");
+            assert_eq!(dst, naive_downscale_43(&src, sw, sh), "size {sw}x{sh}");
+        }
+    }
+
     #[test]
     fn matches_naive_reference() {
         // Trailing columns/rows (sw % 6) vary so the never-read tails are
@@ -572,6 +801,25 @@ mod tests {
                     x += 8;
                 }
             }
+        }
+    }
+
+    #[test]
+    fn simd_pair8_matches_phase43() {
+        // One 4:3 EE block covers two 4-px groups: lo bytes = [out0,out1,out2 of
+        // group g, out0 of g+1], hi bytes 1,2 = [out1,out2 of g+1]. Lane 4 and
+        // lane 7 are don't-cares. Check the lane map against the scalar phases.
+        let mut rng = Lcg(0x0bad_f00d_0000_4300);
+        let mut tmp = vec![0u8; 64 * 16];
+        rng.fill(&mut tmp);
+        for off in 0..(tmp.len() - 16) {
+            let b = simd_pair8(&tmp, off, off + 1, &HW43_1.0, &HW43_2.0).map(u32::to_le_bytes);
+            assert_eq!(b[0][0], tmp[off], "off {off} g out0");
+            assert_eq!(b[0][1], phase43(1, tmp[off + 1], tmp[off + 2]), "off {off} g out1");
+            assert_eq!(b[0][2], phase43(2, tmp[off + 2], tmp[off + 3]), "off {off} g out2");
+            assert_eq!(b[0][3], tmp[off + 4], "off {off} g+1 out0");
+            assert_eq!(b[1][1], phase43(1, tmp[off + 5], tmp[off + 6]), "off {off} g+1 out1");
+            assert_eq!(b[1][2], phase43(2, tmp[off + 6], tmp[off + 7]), "off {off} g+1 out2");
         }
     }
 

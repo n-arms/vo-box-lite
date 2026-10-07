@@ -15,6 +15,39 @@ import pycolmap
 MIN_FRAME_POINTS = 8  # PnP needs >= 8; frames below this can never localize
 
 
+def _quat_from_matrix(R) -> "np.ndarray":
+    """3x3 rotation -> [qx, qy, qz, qw] (Shepperd, w>=0)."""
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2
+        q = [(R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s,
+             (R[1, 0] - R[0, 1]) / s, 0.25 * s]
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        q = [0.25 * s, (R[0, 1] + R[1, 0]) / s,
+             (R[0, 2] + R[2, 0]) / s, (R[2, 1] - R[1, 2]) / s]
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        q = [(R[0, 1] + R[1, 0]) / s, 0.25 * s,
+             (R[1, 2] + R[2, 1]) / s, (R[0, 2] - R[2, 0]) / s]
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        q = [(R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s,
+             0.25 * s, (R[1, 0] - R[0, 1]) / s]
+    out = np.asarray(q, dtype=np.float64)
+    out[:3] *= 1.0 if out[3] >= 0 else -1.0
+    out[3] = abs(out[3])
+    return out
+
+
+def _image_pose(im):
+    """-> (R_cw 3x3, C 3): world->camera rotation + camera center."""
+    cfw = im.cam_from_world
+    cfw = cfw() if callable(cfw) else cfw
+    return np.asarray(cfw.rotation.matrix(), dtype=np.float64), \
+        np.asarray(im.projection_center(), dtype=np.float64)
+
+
 def load_descriptors(features_dir: Path):
     """stem -> list of 64-char hex descriptor strings (row order = feature idx)."""
     descs = {}
@@ -83,6 +116,8 @@ def build_map_file(workdir: Path, features_dir: Path, out: Path,
     if recon.num_cameras() != 1:
         raise RuntimeError(f"expected exactly 1 camera, found {recon.num_cameras()}")
     cam = list(recon.cameras.values())[0]
+    # Per-image pose from the best model (world->camera R + camera center C).
+    poses = {Path(im.name).stem: _image_pose(im) for im in recon.images.values()}
 
     frames, skipped = collect_frame_points(workdir, features_dir, exclude)
     below = [s for s, p in frames.items() if len(p) < min_points]
@@ -96,9 +131,18 @@ def build_map_file(workdir: Path, features_dir: Path, out: Path,
         f.write(f"CAMERA {cam.model_name} " +
                 " ".join(f"{p:.10g}" for p in cam.params) + "\n")
         f.write("# FRAME <image> <1064-byte calc8 embedding, hex>\n")
+        f.write("# camera pose is `# POSE <image> <qx qy qz qw> <cx cy cz>`, map\n")
+        f.write("#   frame, q world->camera, C the camera center;\n")
+        f.write("#   P_cam = R(q) * (P_world - C). Parsed by vo_replay.rs for the\n")
+        f.write("#   pose-prior windowed matcher; older parsers skip it.\n")
         f.write("# POINT x y z <64-hex-char rBRIEF descriptor>, under its FRAME\n")
         for stem in sorted(kept):
             f.write(f"FRAME {stem} {embeddings[stem].hex()}\n")
+            if stem in poses:
+                R, C = poses[stem]
+                q = _quat_from_matrix(R)
+                f.write("# POSE %s %s %s %s %s %s %s %s\n" % (
+                    stem, *(f"{v:.10g}" for v in (*q, *C))))
             for (x, y, z, hexd) in kept[stem]:
                 f.write(f"POINT {x:.10g} {y:.10g} {z:.10g} {hexd}\n")
 
@@ -111,6 +155,7 @@ def build_map_file(workdir: Path, features_dir: Path, out: Path,
         "n_images": recon.num_images(),
         "n_points3d": recon.num_points3D(),
         "n_frames": len(kept),
+        "n_poses": sum(1 for s in kept if s in poses),
         "n_map_points": sum(len(p) for p in kept.values()),
         "skipped": {**skipped, "below_min_points": len(below),
                     "no_embedding": len(no_emb)},

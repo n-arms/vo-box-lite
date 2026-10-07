@@ -8,6 +8,7 @@
 #![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 
 pub mod blur;
+pub mod ekf;
 pub mod downscale;
 pub mod fast;
 pub mod localize;
