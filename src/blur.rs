@@ -31,6 +31,34 @@ static SIMD_INV25: u16 = 41944;
 #[cfg(target_arch = "xtensa")]
 const SIMD_SAR: usize = 20;
 
+/// Latched once any EE blur block runs, so the app can prove the SIMD kernel
+/// (not a stale scalar build) executed; one relaxed store per `box_blur5x5`.
+#[cfg(target_arch = "xtensa")]
+static SIMD_USED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// One relaxed store per `box_blur5x5` call (never inside the pixel loops).
+fn mark_simd_used(used: bool) {
+    #[cfg(target_arch = "xtensa")]
+    if used {
+        SIMD_USED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    let _ = used;
+}
+
+/// True once the EE blur kernel has run a block (host always false).
+pub fn blur_simd_used() -> bool {
+    #[cfg(target_arch = "xtensa")]
+    {
+        SIMD_USED.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        false
+    }
+}
+
 /// Clamped 25-tap box at pixel (`y`, `x`). Slow but only used for border rows
 /// (≤ 4 per frame) and tiny frames.
 fn blur_px_clamped(src: &[u8], w: usize, h: usize, y: usize, x: usize) -> u8 {
@@ -226,10 +254,12 @@ fn simd_aligned(vcol: *const u16) -> bool {
 
 /// Slide the vertical window one row: `vcol += src[add] - src[drop]`, 16 cols
 /// per EE block. Column sums stay in `0..=1275`, so u16 arithmetic is exact.
-fn vcol_advance(src: &[u8], w: usize, drop: usize, add: usize, vcol: &mut [u16]) {
+/// Returns true when at least one EE block ran.
+fn vcol_advance(src: &[u8], w: usize, drop: usize, add: usize, vcol: &mut [u16]) -> bool {
     let a = &src[drop * w..(drop + 1) * w];
     let b = &src[add * w..(add + 1) * w];
     let mut x = 0usize;
+    let mut used = false;
     if simd_aligned(vcol.as_ptr()) {
         while x + 16 <= w {
             // The two aligned blocks under the source window reach up to 15 B
@@ -249,6 +279,7 @@ fn vcol_advance(src: &[u8], w: usize, drop: usize, add: usize, vcol: &mut [u16])
                 }
             }
             simd_vcol_block16(vcol, x, b, a);
+            used = true;
             x += 16;
         }
     }
@@ -256,21 +287,24 @@ fn vcol_advance(src: &[u8], w: usize, drop: usize, add: usize, vcol: &mut [u16])
         vcol[xi] += b[xi] as u16;
         vcol[xi] -= a[xi] as u16;
     }
+    used
 }
 
 /// Horizontal 5-tap over `vcol` -> one output row (clamped ends, EE interior).
-/// Requires `w >= 5`.
-fn out_row_from_vcol(vcol: &[u16], w: usize, dst_row: &mut [u8]) {
+/// Requires `w >= 5`. Returns true when at least one EE block ran.
+fn out_row_from_vcol(vcol: &[u16], w: usize, dst_row: &mut [u8]) -> bool {
     let v = vcol;
     // x = 0, 1: windows (0,0,0,1,2) and (0,0,1,2,3).
     dst_row[0] = div25(3 * v[0] + v[1] + v[2]);
     dst_row[1] = div25(2 * v[0] + v[1] + v[2] + v[3]);
     // Interior: EE blocks while a full block + trailing context fits.
     let mut x = 2usize;
+    let mut used = false;
     if simd_aligned(vcol.as_ptr()) {
         while x + 14 <= w {
             let words = simd_out_block8(vcol, x);
             store8(dst_row, x, words);
+            used = true;
             x += 8;
         }
     }
@@ -287,6 +321,7 @@ fn out_row_from_vcol(vcol: &[u16], w: usize, dst_row: &mut [u8]) {
     // x = w-2, w-1: windows (...,w-1,w-1) and (...,w-1,w-1,w-1).
     dst_row[w - 2] = div25(v[w - 4] + v[w - 3] + v[w - 2] + 2 * v[w - 1]);
     dst_row[w - 1] = div25(v[w - 3] + v[w - 2] + 3 * v[w - 1]);
+    used
 }
 
 /// 5x5 box blur (clamped borders), `src` -> `dst` (w*h bytes each). `scratch`
@@ -316,13 +351,15 @@ pub fn box_blur5x5(
     }
     // ... interior rows 2..=h-3: vertical running sums + horizontal slide.
     vcol_init(src, width, vcol); // window of output row 2 = source rows 0..4
+    let mut used = false;
     for y in RADIUS..height - RADIUS {
-        out_row_from_vcol(vcol, width, &mut dst[y * width..(y + 1) * width]);
+        used |= out_row_from_vcol(vcol, width, &mut dst[y * width..(y + 1) * width]);
         if y < height - 3 {
             // Next output row's window drops row y-2, adds row y+3.
-            vcol_advance(src, width, y - 2, y + 3, vcol);
+            used |= vcol_advance(src, width, y - 2, y + 3, vcol);
         }
     }
+    mark_simd_used(used);
     // Bottom 2 border rows (window clamps source row h-1).
     for y in height - RADIUS..height {
         fill_row_clamped(src, dst, width, height, y);

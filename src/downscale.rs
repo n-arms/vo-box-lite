@@ -265,6 +265,21 @@ static VW43_2: [V8; 3] = [V8([0; 8]), V8([43; 8]), V8([85; 8])];
 #[cfg(target_arch = "xtensa")]
 static SIMD43_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+static FUSED43_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Select the fused-CPU 4:3 path (internal SRAM stripe buffer, no GDMA) over
+/// the PSRAM-GDMA path on S3. Both are byte-identical to the two-pass path.
+/// Measured: `bench` logs `ds=` per level; flip to A/B.
+pub const USE_FUSED43_CPU: bool = true;
+
+/// Largest 4:3 output width the fused stripe buffer (`4*dw` B, on the stack)
+/// is sized for (VGA). Wider sources fall back to the two-pass path.
+const FUSED43_MAX_DW: usize = 3 * (640 / 4);
+
+/// 16-byte-aligned holder so the EE h-pass engages from the first group.
+#[repr(align(16))]
+struct Hbuf43([u8; 4 * FUSED43_MAX_DW]);
+
 /// Latched once any 4:3 EE group runs (one relaxed store per `downscale_43`).
 fn mark_simd43_used(used: bool) {
     #[cfg(target_arch = "xtensa")]
@@ -358,43 +373,98 @@ fn hpass43(src: &[u8], sw: usize, sh: usize, dw: usize, tmp: &mut [u8]) -> bool 
     used
 }
 
-/// Vertical 4:3 pass: tmp (strided dw) -> dst, each 4-row block -> 3 rows,
-/// `dst[3b+k][x] = (W1[k]*tmp[4b+k][x] + W2[k]*tmp[4b+k+1][x]) >> 7`. 8 outputs
-/// per EE window pair with the per-phase weight broadcast; scalar edges/tail.
-fn vpass43(tmp: &[u8], dw: usize, dh: usize, dst: &mut [u8]) -> bool {
-    let blocks = dh / 3; // == sh / 4
+/// One 4:3 v-pass output row (`k` in 0..3): with `r0`/`r1` the two source rows,
+/// `d[x] = (W1[k]*tmp[r0+x] + W2[k]*tmp[r1+x]) >> 7`. 8 outputs per EE window
+/// pair; scalar edges/tail. Shared by `vpass43` and the fused stripe path.
+fn combine43_row(tmp: &[u8], r0: usize, r1: usize, k: usize, dw: usize, d: &mut [u8]) -> bool {
     let t0 = tmp.as_ptr() as usize;
     let t1 = t0 + tmp.len();
+    let mut used = false;
+    let mut x = 0usize;
+    while x + 8 <= dw {
+        if win_ok(t0 + r0 + x, t0, t1) && win_ok(t0 + r1 + x, t0, t1) {
+            used = true;
+            store8(d, x, simd_pair8(tmp, r0 + x, r1 + x, &VW43_1[k].0, &VW43_2[k].0));
+        } else {
+            for j in 0..8 {
+                d[x + j] = phase43(k, tmp[r0 + x + j], tmp[r1 + x + j]);
+            }
+        }
+        x += 8;
+    }
+    while x < dw {
+        d[x] = phase43(k, tmp[r0 + x], tmp[r1 + x]);
+        x += 1;
+    }
+    used
+}
+
+/// Vertical 4:3 pass: tmp (strided dw) -> dst, each 4-row block -> 3 rows,
+/// `dst[3b+k][x] = (W1[k]*tmp[4b+k][x] + W2[k]*tmp[4b+k+1][x]) >> 7`.
+fn vpass43(tmp: &[u8], dw: usize, dh: usize, dst: &mut [u8]) -> bool {
+    let blocks = dh / 3; // == sh / 4
     let mut used = false;
     for b in 0..blocks {
         for k in 0..3 {
             let r0 = (4 * b + k) * dw;
-            let r1 = r0 + dw;
             let d = &mut dst[(3 * b + k) * dw..(3 * b + k + 1) * dw];
-            let mut x = 0usize;
-            while x + 8 <= dw {
-                if win_ok(t0 + r0 + x, t0, t1) && win_ok(t0 + r1 + x, t0, t1) {
-                    used = true;
-                    store8(d, x, simd_pair8(tmp, r0 + x, r1 + x, &VW43_1[k].0, &VW43_2[k].0));
-                } else {
-                    for j in 0..8 {
-                        d[x + j] = phase43(k, tmp[r0 + x + j], tmp[r1 + x + j]);
-                    }
-                }
-                x += 8;
-            }
-            while x < dw {
-                d[x] = phase43(k, tmp[r0 + x], tmp[r1 + x]);
-                x += 1;
-            }
+            used |= combine43_row(tmp, r0, r0 + dw, k, dw, d);
         }
     }
     used
 }
 
+/// Fused 4:3 v-pass for one stripe: `hb` holds the 4 h-passed rows of a 4-row
+/// block (`4*dw` bytes), `dst` the 3 output rows (`3*dw`). Same arithmetic as
+/// `vpass43` (this is the SRAM-side half of the DMA double-buffered path).
+fn vpass43_stripe(hb: &[u8], dw: usize, dst: &mut [u8]) -> bool {
+    let mut used = false;
+    for k in 0..3 {
+        let r0 = k * dw;
+        used |= combine43_row(hb, r0, r0 + dw, k, dw, &mut dst[k * dw..(k + 1) * dw]);
+    }
+    used
+}
+
+/// Fused 4:3 CPU path: the source is read directly, 4 rows are h-passed into a
+/// small internal SRAM stripe buffer (`hb`, `4*dw` B, stack), then immediately
+/// v-passed into `dst`. Same arithmetic as `hpass43`+`vpass43`, but the full
+/// `dw*sh` intermediate never touches PSRAM. False (decline) if `dw` is too
+/// wide for the stack buffer; `< 4` rows is a no-op.
+fn fused43_cpu(src: &[u8], sw: usize, sh: usize, dst: &mut [u8]) -> bool {
+    let dw = downscale_43_size(sw);
+    let dh = downscale_43_size(sh);
+    if dw > FUSED43_MAX_DW {
+        return false;
+    }
+    let blocks = dh / 3; // == sh / 4
+    if blocks == 0 {
+        return true;
+    }
+    let mut buf = Hbuf43([0u8; 4 * FUSED43_MAX_DW]);
+    let hb = &mut buf.0[..4 * dw];
+    let mut ee = false;
+    for b in 0..blocks {
+        let stripe = &src[4 * b * sw..4 * (b + 1) * sw];
+        ee |= hpass43(stripe, sw, 4, dw, hb);
+        ee |= vpass43_stripe(hb, dw, &mut dst[3 * b * dw..3 * (b + 1) * dw]);
+    }
+    mark_simd43_used(ee);
+    FUSED43_USED.store(true, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// True once the fused-CPU 4:3 path has reduced a stripe.
+pub fn fused43_cpu_used() -> bool {
+    FUSED43_USED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// 4:3 downsample src (sw x sh) -> dst (dw x dh) with sizes from the fixed
 /// ratio. `tmp` = caller-owned h-pass scratch (dw x sh u8); dst must not alias
-/// src/tmp. False on invalid sizes; < 4 axis: empty output.
+/// src/tmp. False on invalid sizes; < 4 axis: empty output. With
+/// `USE_FUSED43_CPU` the source is reduced 4 rows at a time into an internal
+/// SRAM stripe buffer (`tmp` unused); on S3 with the const off the source is
+/// streamed in over AHB-GDMA instead; the scalar/EE two-pass is the fallback.
 pub fn downscale_43(
     src: &[u8],
     sw: usize,
@@ -412,11 +482,246 @@ pub fn downscale_43(
     {
         return false;
     }
+    if USE_FUSED43_CPU && fused43_cpu(src, sw, sh, dst) {
+        return true;
+    }
+    #[cfg(target_arch = "xtensa")]
+    {
+        if !USE_FUSED43_CPU && dma43::try_downscale(src, sw, sh, dst) {
+            return true;
+        }
+    }
     // dw/dh == 0 (axis < 4): hpass/vpass have no groups and no-op.
     let h_used = hpass43(src, sw, sh, dw, tmp);
     let v_used = vpass43(tmp, dw, dh, dst);
     mark_simd43_used(h_used | v_used);
     true
+}
+
+// ---- PSRAM-DMA 4:3 downscale (ESP32-S3 AHB-GDMA) ----
+//
+// Streams each 4-source-row stripe into internal SRAM with `esp_async_memcpy`
+// while the previous stripe is h+v-reduced, then stores the 3 result rows. The
+// driver owns cache coherency (C2M writeback of the PSRAM source; RX split +
+// invalidate of the SRAM destination). Output is bit-identical to `downscale_43`.
+#[cfg(target_arch = "xtensa")]
+mod dma43 {
+    use super::{downscale_43_size, hpass43, vpass43_stripe};
+    use core::ffi::c_void;
+    use core::hint::spin_loop;
+    use core::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
+
+    type Handle = *mut c_void;
+    #[repr(C)]
+    struct Event {
+        data: *mut c_void,
+    }
+    type Cb = extern "C" fn(Handle, *mut Event, *mut c_void) -> bool;
+    #[repr(C)]
+    struct Config {
+        backlog: u32,
+        sram_trans_align: usize,
+        psram_trans_align: usize,
+        flags: u32,
+    }
+    extern "C" {
+        fn esp_async_memcpy_install_gdma_ahb(cfg: *const Config, out: *mut Handle) -> i32;
+        fn esp_async_memcpy(
+            h: Handle,
+            dst: *mut c_void,
+            src: *mut c_void,
+            n: usize,
+            cb: Cb,
+            args: *mut c_void,
+        ) -> i32;
+        fn heap_caps_aligned_alloc(align: usize, size: usize, caps: u32) -> *mut c_void;
+        /// True only for real PSRAM (`esp_psram_check_ptr_addr`), not the flash
+        /// DROM that aliases the same 0x3C000000 range on the S3.
+        fn esp_ptr_dma_ext_capable(p: *const c_void) -> bool;
+    }
+
+    /// Internal DRAM that AHB-GDMA can also read (SOC_DMA_LOW..SOC_DMA_HIGH).
+    const DMA_INT_LOW: usize = 0x3FC8_8000;
+    const DMA_INT_HIGH: usize = 0x3FD0_0000;
+
+    const CAP_INTERNAL: u32 = 1 << 11;
+    const CAP_DMA: u32 = 1 << 3;
+    const CAP_8BIT: u32 = 1 << 2;
+    /// Cache-line aligned buffers keep the driver off its stash-copy path.
+    const ALIGN: usize = 64;
+    const LINE: usize = 32;
+
+    /// Largest level-0 width the PSRAM inboxes are sized for (VGA).
+    const MAX_SW: usize = 640;
+    const MAX_DW: usize = 3 * (MAX_SW / 4);
+    const IN_CAP: usize = 4 * MAX_SW;
+    const HB_CAP: usize = 4 * MAX_DW;
+
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 uninit, 1 ready, 2 failed
+    static HD: AtomicUsize = AtomicUsize::new(0);
+    static IN: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    static HB: AtomicUsize = AtomicUsize::new(0);
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    static USED: AtomicU8 = AtomicU8::new(0);
+
+    extern "C" fn on_done(_h: Handle, _e: *mut Event, _a: *mut c_void) -> bool {
+        DONE.fetch_add(1, Ordering::Release);
+        false
+    }
+
+    fn init() -> bool {
+        match STATE.load(Ordering::Acquire) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        unsafe {
+            let cfg = Config {
+                backlog: 4,
+                sram_trans_align: 0,
+                psram_trans_align: 16,
+                flags: 0,
+            };
+            let mut hd: Handle = core::ptr::null_mut();
+            if esp_async_memcpy_install_gdma_ahb(&cfg, &mut hd) != 0 || hd.is_null() {
+                STATE.store(2, Ordering::Release);
+                return false;
+            }
+            let caps = CAP_INTERNAL | CAP_DMA | CAP_8BIT;
+            for i in 0..2 {
+                let p = heap_caps_aligned_alloc(ALIGN, IN_CAP, caps) as usize;
+                if p == 0 {
+                    STATE.store(2, Ordering::Release);
+                    return false;
+                }
+                IN[i].store(p, Ordering::Release);
+            }
+            let hb = heap_caps_aligned_alloc(ALIGN, HB_CAP, caps) as usize;
+            if hb == 0 {
+                STATE.store(2, Ordering::Release);
+                return false;
+            }
+            HB.store(hb, Ordering::Release);
+            HD.store(hd as usize, Ordering::Release);
+            STATE.store(1, Ordering::Release);
+            true
+        }
+    }
+
+    /// True once the PSRAM-DMA path has actually reduced a stripe (host never
+    /// reaches this module).
+    pub fn used() -> bool {
+        USED.load(Ordering::Relaxed) != 0
+    }
+
+    fn drain(want: u32) {
+        while DONE.load(Ordering::Acquire) < want {
+            spin_loop();
+        }
+    }
+
+    /// `true` = handled (possibly a degenerate no-op), `false` = decline so the
+    /// caller runs the scalar/EE two-pass path.
+    pub fn try_downscale(src: &[u8], sw: usize, sh: usize, dst: &mut [u8]) -> bool {
+        if sw == 0 || sw > MAX_SW {
+            return false;
+        }
+        // GDMA cannot read flash, and on the S3 DROM aliases the PSRAM address
+        // window (same 0x3C000000 base) so `esp_ptr_external_ram` is not enough.
+        // A flash source (e.g. a baked `include_bytes!` test frame) would DMA
+        // zeros: decline to the scalar path unless the source is PSRAM/internal.
+        let sp = src.as_ptr() as usize;
+        let src_dma = unsafe { esp_ptr_dma_ext_capable(src.as_ptr() as *const c_void) }
+            || (sp >= DMA_INT_LOW && sp < DMA_INT_HIGH);
+        if !src_dma {
+            return false;
+        }
+        if !init() {
+            return false;
+        }
+        let dw = downscale_43_size(sw);
+        let dh = downscale_43_size(sh);
+        if dw == 0 || dh == 0 {
+            return true;
+        }
+        let blocks = dh / 3; // == sh / 4
+        if blocks == 0 {
+            return true;
+        }
+        let hd = HD.load(Ordering::Acquire) as Handle;
+        let in0 = IN[0].load(Ordering::Acquire) as *mut u8;
+        let in1 = IN[1].load(Ordering::Acquire) as *mut u8;
+        let hb = HB.load(Ordering::Acquire) as *mut u8;
+        let exact = 4 * sw;
+        // Round the transfer up to a whole cache line where that stays inside
+        // `src`; the extra bytes land in the SRAM inbox and are never read.
+        let aligned = (exact + LINE - 1) & !(LINE - 1);
+        let blen = |b: usize| {
+            let off = b * exact;
+            if off + aligned <= src.len() {
+                aligned
+            } else {
+                exact
+            }
+        };
+        DONE.store(0, Ordering::Release);
+        unsafe {
+            if esp_async_memcpy(
+                hd,
+                in0 as *mut c_void,
+                src.as_ptr() as *mut c_void,
+                blen(0),
+                on_done,
+                core::ptr::null_mut(),
+            ) != 0
+            {
+                return false;
+            }
+            let mut issued = 1u32;
+            let mut ee = false;
+            for b in 0..blocks {
+                let cur = if b & 1 == 0 { in0 } else { in1 };
+                if b + 1 < blocks {
+                    let nxt = if b & 1 == 0 { in1 } else { in0 };
+                    let off = (b + 1) * exact;
+                    if esp_async_memcpy(
+                        hd,
+                        nxt as *mut c_void,
+                        src.as_ptr().add(off) as *mut c_void,
+                        blen(b + 1),
+                        on_done,
+                        core::ptr::null_mut(),
+                    ) != 0
+                    {
+                        drain(issued);
+                        return false;
+                    }
+                    issued += 1;
+                }
+                drain((b + 1) as u32);
+                let in_slice = core::slice::from_raw_parts(cur as *const u8, exact);
+                let hb_slice = core::slice::from_raw_parts_mut(hb, 4 * dw);
+                ee |= hpass43(in_slice, sw, 4, dw, &mut *hb_slice);
+                let d = &mut dst[3 * b * dw..(3 * b + 3) * dw];
+                ee |= vpass43_stripe(hb_slice, dw, d);
+            }
+            super::mark_simd43_used(ee);
+        }
+        USED.store(1, Ordering::Relaxed);
+        true
+    }
+}
+
+/// True once the PSRAM-DMA 4:3 downscale has reduced a stripe (host: false).
+pub fn dma43_used() -> bool {
+    #[cfg(target_arch = "xtensa")]
+    {
+        dma43::used()
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        false
+    }
 }
 
 /// Output size for one axis of the fixed 4:1 ratio (4x4 block -> 1 px): `n / 4`.
@@ -730,6 +1035,46 @@ mod tests {
             let mut dst = vec![0xBBu8; dw * dh];
             assert!(downscale_43(&src, sw, sh, &mut tmp, &mut dst), "size {sw}x{sh}");
             assert_eq!(dst, naive_downscale_43(&src, sw, sh), "size {sw}x{sh}");
+        }
+    }
+
+    #[test]
+    fn fused43_stripe_matches_downscale_43() {
+        // The DMA path reduces 4-row stripes with hpass43 + vpass43_stripe; it
+        // must be byte-identical to the full-image hpass43 + vpass43.
+        let sizes: &[(usize, usize)] = &[
+            (640, 480),
+            (480, 360),
+            (360, 270),
+            (270, 201),
+            (201, 150),
+            (16, 16),
+            (13, 9),
+            (7, 7),
+            (9, 13),
+            (20, 20),
+            (11, 17),
+        ];
+        for &(sw, sh) in sizes {
+            let mut rng = Lcg(0xDEAD_BEEF ^ ((sw as u64) << 32) ^ (sh as u64));
+            let mut src = vec![0u8; sw * sh];
+            rng.fill(&mut src);
+            let dw = downscale_43_size(sw);
+            let dh = downscale_43_size(sh);
+            if dw == 0 || dh == 0 {
+                continue;
+            }
+            let mut tmp = vec![0xAAu8; dw * sh];
+            let mut reference = vec![0xBBu8; dw * dh];
+            assert!(downscale_43(&src, sw, sh, &mut tmp, &mut reference), "{sw}x{sh}");
+            let mut hb = vec![0u8; 4 * dw];
+            let mut fused = vec![0xCCu8; dw * dh];
+            for b in 0..dh / 3 {
+                let stripe = &src[4 * b * sw..4 * (b + 1) * sw];
+                hpass43(stripe, sw, 4, dw, &mut hb);
+                vpass43_stripe(&hb, dw, &mut fused[3 * b * dw..(3 * b + 3) * dw]);
+            }
+            assert_eq!(fused, reference, "{sw}x{sh}");
         }
     }
 

@@ -1,6 +1,7 @@
 //! Five-slot scale pyramid: level 0 = source, levels 1..4 are 4:3-downscaled
-//! from the previous. All five levels are extracted. Per level: FAST-12 -> box
-//! blur -> rBRIEF (border keypoints dropped); positions project to level-0 as
+//! from the previous. All five levels are extracted. Per level: FAST-12 ->
+//! rBRIEF (border keypoints dropped); **only level 0 is blurred** — levels 1+
+//! describe the raw downscaled image. Positions project to level-0 as
 //! `x * (4/3)^level`. no_std, caller-owned buffers.
 
 use crate::blur::box_blur5x5;
@@ -10,7 +11,7 @@ use crate::fast;
 use crate::rbrief;
 
 /// Pyramid slots. Level 0 = the caller's source frame; levels 1..=4 are the
-/// downscaled images. All slots run FAST+blur+rBRIEF.
+/// downscaled images. Level 0 runs FAST+blur+rBRIEF; levels 1+ run FAST+rBRIEF.
 pub const LEVELS: usize = 5;
 /// Fixed 4:3 pyramid ratio (the downscaler's scale per level).
 pub const SCALE: f32 = 4.0 / 3.0;
@@ -60,6 +61,30 @@ pub const fn bucket_cells(w: usize, h: usize) -> usize {
     } else {
         (w + BUCKET_CELL - 1) / BUCKET_CELL * ((h + BUCKET_CELL - 1) / BUCKET_CELL)
     }
+}
+
+/// Dedup grid cell pitch in level-0 px. Must be >= `DEDUP_PX` so that any kept
+/// point within `DEDUP_PX` shares the candidate's cell or one of its 8
+/// neighbours (the 3x3 scan is then exact).
+pub const DEDUP_CELL: usize = 8;
+
+/// Dedup grid columns for a `w`-wide frame.
+pub const fn dedup_grid_nx(w: usize) -> usize {
+    (w + DEDUP_CELL - 1) / DEDUP_CELL
+}
+/// Dedup grid rows for an `h`-tall frame.
+pub const fn dedup_grid_ny(h: usize) -> usize {
+    (h + DEDUP_CELL - 1) / DEDUP_CELL
+}
+/// Grid head entries (`u16` each) for a `w` x `h` frame.
+pub const fn dedup_grid_len(w: usize, h: usize) -> usize {
+    dedup_grid_nx(w) * dedup_grid_ny(h)
+}
+/// Size the `dedup` scratch passed to `extract_pyramid`: the `u16` grid heads
+/// (`dedup_grid_len`) followed by one `u16` link per candidate (`CAND_MAX`).
+/// Undersized scratch falls back to the quadratic scan.
+pub const fn dedup_scratch_len(w: usize, h: usize) -> usize {
+    dedup_grid_len(w, h) + CAND_MAX
 }
 
 /// One pyramid feature: descriptor + position projected to level-0 pixels.
@@ -157,6 +182,16 @@ pub fn arena_bytes(w: usize, h: usize) -> usize {
     sz
 }
 
+/// Extraction mode. `Dense` (map side) detects + describes every NMS survivor
+/// so the map is a superset of any query's descriptors — the committed filter
+/// consts are query-side only. `Filtered` (query side) applies cross-level
+/// dedup + spatial bucketing, gated by the consts above.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExtractMode {
+    Dense,
+    Filtered,
+}
+
 /// Extract the whole pyramid from raw level-0 `img` (`w` x `h`) at threshold
 /// `thr`; returns the feature count written to `out` (0 if a buffer is undersized
 /// or there is no interior, w/h < 7). `profile`: optional per-level timers.
@@ -164,12 +199,15 @@ pub fn arena_bytes(w: usize, h: usize) -> usize {
 /// (may be empty when bucketing is off or undersized — bucketing then
 /// degrades to describe-all-deduped, dedup still applies). `cand` holds up to
 /// `CAND_MAX` pre-describe survivors (phase 1); smaller buffers silently cap
-/// the candidate set (all in-repo callers pass `CAND_MAX`).
+/// the candidate set (all in-repo callers pass `CAND_MAX`). `dedup` is the
+/// spatial-hash scratch, `dedup_scratch_len(w, h)` u16s (empty -> quadratic
+/// fallback).
 pub fn extract_pyramid(
     img: &[u8],
     w: usize,
     h: usize,
     thr: i32,
+    mode: ExtractMode,
     arena: &mut [u8],
     work: &mut [u8],
     vcol: &mut [u16],
@@ -179,6 +217,7 @@ pub fn extract_pyramid(
     nms: &mut [fast::Corner],
     cells: &mut [u32],
     cand: &mut [Candidate],
+    dedup: &mut [u16],
     out: &mut [Feature],
     mut profile: Option<&mut PyramidProfile>,
 ) -> usize {
@@ -195,10 +234,11 @@ pub fn extract_pyramid(
         return 0;
     }
 
-    let filtering = DEDUP_PX > 0.0 || bucket_cells(w, h) > 0 && !cells.is_empty();
+    let filtering = mode == ExtractMode::Filtered
+        && (DEDUP_PX > 0.0 || bucket_cells(w, h) > 0 && !cells.is_empty());
     if !filtering {
-        // Legacy unfiltered path (all consts off, no cells scratch): detect +
-        // blur + describe every level exactly as before.
+        // Dense path (map side, or all filter consts off): detect + describe
+        // every level (level 0 blurred, levels 1+ raw).
         let mut total = 0;
         let mut scale = 1.0f32; // accumulates *4/3 per level ((4/3)^l)
         let mut cw = w;
@@ -239,9 +279,9 @@ pub fn extract_pyramid(
     }
     // Filtered path: phase 1 detects every level into `cand` (no blur, no
     // describe); phase 2 selects globally (dedup + floor + bucket); phase 3
-    // blurs only levels that kept winners and describes them. Per-level
-    // describe in phase 1 would let later levels add on top of earlier ones
-    // so the bucket cap never binds — selection must precede any describe.
+    // describes winners (blurring L0 only). Per-level describe in phase 1 would
+    // let later levels add on top of earlier ones so the bucket cap never binds
+    // — selection must precede any describe.
     let cells_nx = (w + BUCKET_CELL.max(1) - 1) / BUCKET_CELL.max(1);
     let cells_ny = (h + BUCKET_CELL.max(1) - 1) / BUCKET_CELL.max(1);
     let cells_ok =
@@ -326,24 +366,67 @@ pub fn extract_pyramid(
     let r2 = DEDUP_PX * DEDUP_PX;
     let do_dedup = DEDUP_PX > 0.0;
     let mut n1 = 0usize; // deduped count (compacted in cand)
-    for i in 0..nc {
-        if do_dedup {
+    // Spatial-hash dedup: DEDUP_CELL >= DEDUP_PX, so every kept point within
+    // DEDUP_PX shares the candidate's cell or one of its 8 neighbours — the 3x3
+    // scan sees exactly what the O(n^2) scan would, in the same order (same
+    // result). Undersized `dedup` scratch falls back to the quadratic scan.
+    let glen = dedup_grid_len(w, h);
+    let gnx = dedup_grid_nx(w);
+    let gny = dedup_grid_ny(h);
+    if do_dedup && gnx > 0 && gny > 0 && dedup.len() >= glen + nc {
+        let (head, next) = dedup.split_at_mut(glen);
+        head.fill(u16::MAX);
+        let inv = 1.0 / DEDUP_CELL as f32;
+        for i in 0..nc {
             let (x0, y0) = (cand[i].x0, cand[i].y0);
+            let gx = ((x0 * inv) as usize).min(gnx - 1);
+            let gy = ((y0 * inv) as usize).min(gny - 1);
             let mut dup = false;
-            for k in 0..n1 {
-                let dx = cand[k].x0 - x0;
-                let dy = cand[k].y0 - y0;
-                if dx * dx + dy * dy < r2 {
-                    dup = true;
-                    break;
+            'scan: for yy in gy.saturating_sub(1)..=(gy + 1).min(gny - 1) {
+                let row = yy * gnx;
+                for xx in gx.saturating_sub(1)..=(gx + 1).min(gnx - 1) {
+                    let mut k = head[row + xx];
+                    while k != u16::MAX {
+                        let kk = k as usize;
+                        let dx = cand[kk].x0 - x0;
+                        let dy = cand[kk].y0 - y0;
+                        if dx * dx + dy * dy < r2 {
+                            dup = true;
+                            break 'scan;
+                        }
+                        k = next[kk];
+                    }
                 }
             }
             if dup {
                 continue;
             }
+            cand[n1] = cand[i];
+            let cell = gy * gnx + gx;
+            next[n1] = head[cell];
+            head[cell] = n1 as u16;
+            n1 += 1;
         }
-        cand[n1] = cand[i];
-        n1 += 1;
+    } else {
+        for i in 0..nc {
+            if do_dedup {
+                let (x0, y0) = (cand[i].x0, cand[i].y0);
+                let mut dup = false;
+                for k in 0..n1 {
+                    let dx = cand[k].x0 - x0;
+                    let dy = cand[k].y0 - y0;
+                    if dx * dx + dy * dy < r2 {
+                        dup = true;
+                        break;
+                    }
+                }
+                if dup {
+                    continue;
+                }
+            }
+            cand[n1] = cand[i];
+            n1 += 1;
+        }
     }
     // Winner idx needs 13 packed bits; above that the bucket is skipped
     // (CAND_MAX == 8192 keeps this a formality).
@@ -394,9 +477,9 @@ pub fn extract_pyramid(
             nw += 1;
         }
     }
-    // Phase 3: blur each winning level once, describe its winners (level
-    // images persist: L0 is `img`, L1+ are the arena regions phase 1 wrote).
-    // Winners arrive level-major, so one blur covers each level's run.
+    // Phase 3: describe winners (blurring level 0 once). Level images persist:
+    // L0 is `img`, L1+ are the arena regions phase 1 wrote. Winners arrive
+    // level-major, so one blur covers each level's run.
     let mut total = 0;
     let mut angle_cyc = 0u64;
     let mut sample_cyc = 0u64;
@@ -404,6 +487,7 @@ pub fn extract_pyramid(
     let mut lvl = 255u8; // level currently blurred into work (none)
     let mut cwl = 0usize;
     let mut chl = 0usize;
+    let mut desc_img: &[u8] = &[];
     let mut seg_t0 = profile.as_ref().map(|pr| (pr.now_us)());
     for wi in 0..nw {
         if total >= out.len() {
@@ -421,19 +505,25 @@ pub fn extract_pyramid(
             let (img_l, dw, dh) = level_image(img, &*arena, w, h, lvl as usize);
             cwl = dw;
             chl = dh;
-            if let Some(pr) = profile.as_deref_mut() {
+            if lvl > 0 {
+                desc_img = img_l;
+            } else if let Some(pr) = profile.as_deref_mut() {
                 let t0 = (pr.now_us)();
                 if !box_blur5x5(img_l, work, cwl, chl, vcol) {
                     break;
                 }
                 pr.blur_us[lvl as usize] = (pr.now_us)().wrapping_sub(t0);
-            } else if !box_blur5x5(img_l, work, cwl, chl, vcol) {
-                break;
+                desc_img = work;
+            } else {
+                if !box_blur5x5(img_l, work, cwl, chl, vcol) {
+                    break;
+                }
+                desc_img = work;
             }
             seg_t0 = profile.as_ref().map(|pr| (pr.now_us)());
         }
         if describe_survivor(
-            work, cwl, chl,
+            desc_img, cwl, chl,
             fast::Corner { x: c.x as usize, y: c.y as usize },
             lvl, scales[lvl as usize], out, total, &mut angle_cyc, &mut sample_cyc,
         ) {
@@ -533,8 +623,9 @@ fn detect_level(
     n
 }
 
-/// FAST-12 (detect -> score -> NMS) + 5x5 blur + rBRIEF on one level (`src`,
-/// `cw` x `ch`). NMS runs on the raw image (the blur feeds rBRIEF only). Appends
+/// FAST-12 (detect -> score -> NMS) + rBRIEF on one level (`src`, `cw` x `ch`).
+/// NMS runs on the raw image; only level 0 is 5x5-box-blurred before rBRIEF.
+/// Appends
 /// to `out[total..]`, returns the count; `profile` fills this level's timers.
 /// Legacy unfiltered path (all filter consts off); the filtered path below
 /// detects through `detect_level` and selects globally instead.
@@ -560,14 +651,20 @@ fn process_level(
     let n = detect_level(
         src, cw, ch, thr, corners, scores, rowidx, nms, profile.as_deref_mut(), li,
     );
-    // Blur after FAST, before description.
+    // Blur after FAST, before description. Only level 0 is blurred; levels 1+
+    // describe the raw downscaled image (measured ΔATE ~1 mm on V1_01).
     let mut t0 = 0u64;
     if let Some(pr) = profile.as_deref_mut() {
         t0 = (pr.now_us)();
     }
-    if !box_blur5x5(src, work, cw, ch, vcol) {
-        return 0;
-    }
+    let desc_img: &[u8] = if li > 0 {
+        src
+    } else {
+        if !box_blur5x5(src, work, cw, ch, vcol) {
+            return 0;
+        }
+        work
+    };
     if let Some(pr) = profile.as_deref_mut() {
         pr.blur_us[li] = (pr.now_us)() - t0;
         t0 = (pr.now_us)();
@@ -582,7 +679,7 @@ fn process_level(
             break;
         }
         if describe_survivor(
-            work, cw, ch, nms[i], level, scale, out, total + added, &mut angle_cyc,
+            desc_img, cw, ch, nms[i], level, scale, out, total + added, &mut angle_cyc,
             &mut sample_cyc,
         ) {
             added += 1;

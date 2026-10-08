@@ -12,6 +12,33 @@ mod cardinal {
 #[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
 static SIGN_BYTE: u8 = 0x80;
 
+/// Latched once any EE FAST group runs, so the app can prove the SIMD kernel
+/// (not a stale scalar build) executed; one relaxed store per detect call.
+#[cfg(target_arch = "xtensa")]
+static SIMD_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// One relaxed store per `fast12_detect_ee` call (never inside the row loop).
+fn mark_simd_used(used: bool) {
+    #[cfg(target_arch = "xtensa")]
+    if used {
+        SIMD_USED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    let _ = used;
+}
+
+/// True once the EE FAST kernel has run a group (host always false).
+pub fn fast12_ee_simd_used() -> bool {
+    #[cfg(target_arch = "xtensa")]
+    {
+        SIMD_USED.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        false
+    }
+}
+
 /// 16-byte aligned per-group scratch: slots 0..3 = the four flipped pk window
 /// vectors saved by the light pass for the dark pass, slot 4 = the spilled
 /// c_bx bound. 80 bytes total; every slot is 16-aligned.
@@ -243,10 +270,12 @@ pub fn fast12_detect_ee(
 
     // SIMD rows: y in 3..h-4, full 16-lane groups only.
     let mut scr = Scratch([0u8; 80]);
+    let mut used = false;
     for y in 3..h - 4 {
         let row = y * stride;
         let mut x = 0usize;
         while x + 16 <= w {
+            used = true;
             let c = row + x; // center window start byte index
             let words = group_words(
                 im,
@@ -302,6 +331,7 @@ pub fn fast12_detect_ee(
             }
         }
     }
+    mark_simd_used(used);
     n
 }
 

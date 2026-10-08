@@ -987,6 +987,7 @@ struct VoScratch {
     nms: Vec<fast::Corner>,
     cells: Vec<u32>,
     cand: Vec<pyramid::Candidate>,
+    dedup: Vec<u16>,
     feats: Vec<pyramid::Feature>,
     frame: Vec<u8>,
     best_idx: Vec<u32>,
@@ -1015,6 +1016,7 @@ impl VoScratch {
             nms: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
             cells: vec![0u32; pyramid::bucket_cells(CAM_W, CAM_H) * pyramid::BUCKET_K],
             cand: vec![pyramid::Candidate::default(); pyramid::CAND_MAX],
+            dedup: vec![0u16; pyramid::dedup_scratch_len(CAM_W, CAM_H)],
             feats: vec![pyramid::Feature::default(); nf],
             frame: vec![0u8; CAM_W * CAM_H],
             best_idx: vec![0u32; nf],
@@ -1232,9 +1234,9 @@ fn run_vo(
 ) -> VoOut {
     s.frame.copy_from_slice(gray);
     let nraw = pyramid::extract_pyramid(
-        &s.frame, CAM_W, CAM_H, thr, &mut s.arena, &mut s.work, &mut s.vcol,
+        &s.frame, CAM_W, CAM_H, thr, pyramid::ExtractMode::Filtered, &mut s.arena, &mut s.work, &mut s.vcol,
         &mut s.corners, &mut s.scores, &mut s.rowidx, &mut s.nms, &mut s.cells,
-        &mut s.cand, &mut s.feats, None,
+        &mut s.cand, &mut s.dedup, &mut s.feats, None,
     );
     // Offline feature-count experiment (identity when filters are off).
     let (nfeat, _) = reduce_features(

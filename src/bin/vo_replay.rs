@@ -1026,6 +1026,7 @@ fn vo_task(
     let opts = ransac::PnpOptions::default();
     let mut prior_bufs = PriorBufs::new();
     log::info!("vo_task ready ({} map frames)", map.frames.len());
+    let mut nframes = 0u64;
     while let Ok(f) = rx.recv() {
         let Frame { seq, xfer, t_us, spi_ms, gray, prior } = f;
         loc.0.frame.copy_from_slice(&gray);
@@ -1035,19 +1036,32 @@ fn vo_task(
             CAM_W,
             CAM_H,
             pyramid::FAST_THRESHOLD,
+            pyramid::ExtractMode::Filtered,
             &mut loc.0.arena,
             &mut loc.0.work,
-            &mut loc.0.vcol,
+            Localizer::vcol_mut(&mut loc.0.vcol_buf, loc.0.vcol_off, CAM_W),
             &mut loc.0.corners,
             &mut loc.0.scores,
             &mut loc.0.rowidx,
             &mut loc.0.nms,
             &mut loc.0.cells,
             &mut loc.0.cand,
+            &mut loc.0.dedup,
             &mut loc.0.feats,
             None,
         );
         let extract_us = t.elapsed().as_micros() as u64;
+        if nframes == 0 {
+            // First-frame proof the EE kernels (not scalar fallbacks) ran.
+            log::info!(
+                "vo_task: EE used blur={} ds43={} fast={} fused43={} (all must be true)",
+                vo_box_lite::blur::blur_simd_used(),
+                vo_box_lite::downscale::downscale43_simd_used(),
+                vo_box_lite::fast::ee::fast12_ee_simd_used(),
+                vo_box_lite::downscale::fused43_cpu_used(),
+            );
+        }
+        nframes += 1;
         // Branch 1 (strong prior) drives the whole match from the EKF; only
         // when it yields no keyframe do we pay for the calc8 embedding.
         let (stats, used_prior, nkf, survivors, infrustum, cos1, cos2, embed_us) =
@@ -1257,13 +1271,18 @@ struct Localizer {
     embedder: semantic::Embedder,
     arena: Vec<u8>,
     work: Vec<u8>,
-    vcol: Vec<u16>,
+    /// 16-byte-aligned blur scratch: `vcol_buf` over-allocates `w + 8` u16
+    /// and `vcol_off` slices at the aligned offset (bare `vec![0u16; w]` is
+    /// NOT guaranteed aligned, and blur silently runs scalar otherwise).
+    vcol_buf: Vec<u16>,
+    vcol_off: usize,
     corners: Vec<fast::Corner>,
     scores: Vec<i32>,
     rowidx: Vec<usize>,
     nms: Vec<fast::Corner>,
     cells: Vec<u32>,
     cand: Vec<pyramid::Candidate>,
+    dedup: Vec<u16>,
     feats: Vec<pyramid::Feature>,
     best_idx: Vec<u32>,
     best_dist: Vec<u32>,
@@ -1283,17 +1302,28 @@ impl Localizer {
         let (w, h) = (CAM_W, CAM_H);
         let nf = pyramid::MAX_FEATURES;
         let np = MAX_MAP_POINTS;
+        // Over-allocate the blur scratch and slice at the 16-byte-aligned
+        // offset (the EE `vld/vst` kernel needs it; see `bench.rs`).
+        let vcol_buf = vec![0u16; w + 8];
+        let vcol_off = ((16 - (vcol_buf.as_ptr() as usize & 15)) / 2) % 8;
+        debug_assert_eq!((vcol_buf.as_ptr() as usize + vcol_off * 2) & 15, 0);
+        log::info!(
+            "localizer: vcol 16B-aligned: {} (off {vcol_off}), EE xtensa=yes",
+            (vcol_buf.as_ptr() as usize + vcol_off * 2) & 15 == 0,
+        );
         Ok(Localizer {
             embedder: semantic::Embedder::init()?,
             arena: vec![0u8; pyramid::arena_bytes(w, h)],
             work: vec![0u8; w * h],
-            vcol: vec![0u16; w],
+            vcol_buf,
+            vcol_off,
             corners: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
             scores: vec![0i32; pyramid::CORNERS_RAW_MAX],
             rowidx: vec![usize::MAX; h],
             nms: vec![fast::Corner { x: 0, y: 0 }; pyramid::CORNERS_RAW_MAX],
             cells: vec![0u32; pyramid::bucket_cells(w, h) * pyramid::BUCKET_K],
             cand: vec![pyramid::Candidate::default(); pyramid::CAND_MAX],
+            dedup: vec![0u16; pyramid::dedup_scratch_len(w, h)],
             feats: vec![pyramid::Feature::default(); nf],
             best_idx: vec![0u32; nf],
             best_dist: vec![0u32; nf],
@@ -1310,6 +1340,15 @@ impl Localizer {
             emb: [0u8; EMBEDDING_DIM],
             rng: ransac::Xorshift64::new(now_us() | 1),
         })
+    }
+
+    /// Aligned `w`-wide blur scratch from the over-allocated buffer (takes
+    /// only the `vcol_buf` field so call sites can keep their other `&mut
+    /// loc.*` borrows; a `&mut self` method would conflict with those).
+    fn vcol_mut(buf: &mut [u16], off: usize, w: usize) -> &mut [u16] {
+        debug_assert_eq!((buf.as_ptr() as usize + off * 2) & 15, 0);
+        debug_assert!(off + w <= buf.len());
+        &mut buf[off..off + w]
     }
 
     fn localize(
